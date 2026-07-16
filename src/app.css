@@ -1,0 +1,16 @@
+:root {
+	font-family: system-ui, 'Segoe UI', Roboto, sans-serif;
+	color-scheme: dark;
+	color: #ddd;
+	background: #0b0b0f;
+	-webkit-font-smoothing: antialiased;
+}
+
+* {
+	box-sizing: border-box;
+}
+
+body {
+	margin: 0;
+	overflow: hidden;
+}
