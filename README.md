@@ -1,5 +1,7 @@
 # Svelte + TS + Vite
 
+> **Project documentation:** see [docs/what-this-is.md](docs/what-this-is.md) for what this lab is, how the path tracer works, and integration notes. The rest of this README is the stock Vite template.
+
 This template should help get you started developing with Svelte and TypeScript in Vite.
 
 ## Recommended IDE Setup
