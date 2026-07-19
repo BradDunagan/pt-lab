@@ -28,17 +28,32 @@ import { GLTFLoader } from 'three/addons/loaders/GLTFLoader.js';
 import { HDRLoader } from 'three/addons/loaders/HDRLoader.js';
 import { RectAreaLightUniformsLib } from 'three/addons/lights/RectAreaLightUniformsLib.js';
 import { WebGLPathTracer } from 'three-gpu-pathtracer';
+import type { UNet } from 'oidn-web';
 
 export type RenderMode = 'loading' | 'building-bvh' | 'raster' | 'pathtracing';
+
+export type DenoiseState =
+	| 'off'
+	| 'unsupported'
+	| 'loading'
+	| 'ready'
+	| 'denoising'
+	| 'denoised'
+	| 'error';
 
 export interface LabStatus {
 	mode: RenderMode;
 	samples: number;
 	elapsedMs: number;
+	denoise: DenoiseState;
+	/** Sample count the visible denoised image was computed from (0 = none). */
+	denoisedAt: number;
 }
 
 export interface LabOptions {
 	onStatus?: (status: LabStatus) => void;
+	/** Overlay canvas the denoised image is drawn onto (shown via opacity). */
+	denoiseCanvas?: HTMLCanvasElement;
 }
 
 const MODEL_URL = `${import.meta.env.BASE_URL}assets/damaged-helmet.glb`;
@@ -94,8 +109,19 @@ export class PathTracerLab {
 	private patchMat: MeshPhysicalMaterial | null = null;
 	private rectLight: RectAreaLight | null = null;
 
+	private denoiseCanvas?: HTMLCanvasElement;
+	private captureCanvas = document.createElement('canvas');
+	private denoiseEnabled = false;
+	private denoiseState: DenoiseState = 'off';
+	private unet: UNet | null = null;
+	private unetPromise: Promise<UNet> | null = null;
+	private denoiseBusy = false;
+	private denoisedAtSamples = 0;
+	private abortDenoise: (() => void) | null = null;
+
 	constructor(canvas: HTMLCanvasElement, options: LabOptions = {}) {
 		this.onStatus = options.onStatus;
+		this.denoiseCanvas = options.denoiseCanvas;
 
 		this.renderer = new WebGLRenderer({ canvas, antialias: true });
 		this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
@@ -392,22 +418,121 @@ export class PathTracerLab {
 
 		if (this.pathTracer.samples < this.lastSamples) {
 			this.lastResetAt = performance.now();
+			this.hideDenoise();
 		}
 		this.lastSamples = this.pathTracer.samples;
 
+		this.maybeDenoise();
 		this.emit(this.pathTracer.enablePathTracing ? 'pathtracing' : 'raster');
 	};
+
+	/**
+	 * Denoise on a doubling schedule (4, 8, 16, ... samples) so passes get
+	 * rarer as the image converges, plus a final pass when accumulation
+	 * pauses at the sample cap. Must be called right after renderSample()
+	 * so the drawing buffer is still valid to capture.
+	 */
+	private maybeDenoise() {
+		if (!this.denoiseEnabled || !this.unet || this.denoiseBusy) return;
+		if (!this.pathTracer.enablePathTracing) return;
+		const samples = Math.floor(this.pathTracer.samples);
+		const paused = this.maxSamples > 0 && samples >= this.maxSamples;
+		const due =
+			samples >= Math.max(4, this.denoisedAtSamples * 2) ||
+			(paused && samples > this.denoisedAtSamples);
+		if (!due) return;
+
+		const src = this.renderer.domElement;
+		const overlay = this.denoiseCanvas;
+		if (!overlay || src.width === 0 || src.height === 0) return;
+
+		this.denoiseBusy = true;
+		this.denoiseState = 'denoising';
+
+		this.captureCanvas.width = src.width;
+		this.captureCanvas.height = src.height;
+		const cctx = this.captureCanvas.getContext('2d', { willReadFrequently: true })!;
+		cctx.drawImage(src, 0, 0);
+		const image = cctx.getImageData(0, 0, src.width, src.height);
+
+		if (overlay.width !== src.width || overlay.height !== src.height) {
+			overlay.width = src.width;
+			overlay.height = src.height;
+		}
+		const octx = overlay.getContext('2d')!;
+
+		this.abortDenoise = this.unet.tileExecute({
+			color: image,
+			progress: (_out, tileData, tile) => {
+				if (tileData) octx.putImageData(tileData, tile.x, tile.y);
+				overlay.style.opacity = '1';
+			},
+			done: () => {
+				this.abortDenoise = null;
+				this.denoiseBusy = false;
+				this.denoisedAtSamples = samples;
+				this.denoiseState = 'denoised';
+			},
+		});
+	}
+
+	/** Abort any in-flight pass and drop back to the live (noisy) render. */
+	private hideDenoise() {
+		this.abortDenoise?.();
+		this.abortDenoise = null;
+		this.denoiseBusy = false;
+		this.denoisedAtSamples = 0;
+		if (this.denoiseCanvas) this.denoiseCanvas.style.opacity = '0';
+		if (this.denoiseState === 'denoising' || this.denoiseState === 'denoised') {
+			this.denoiseState = 'ready';
+		}
+	}
+
+	async setDenoiseEnabled(enabled: boolean) {
+		this.denoiseEnabled = enabled;
+		if (!enabled) {
+			this.hideDenoise();
+			this.denoiseState = 'off';
+			return;
+		}
+		if (!('gpu' in navigator)) {
+			this.denoiseState = 'unsupported';
+			return;
+		}
+		if (!this.unetPromise) {
+			this.denoiseState = 'loading';
+			// Lazy: oidn-web pulls in tfjs, so only load it on first use.
+			this.unetPromise = import('oidn-web').then(({ initUNetFromURL }) =>
+				initUNetFromURL(`${import.meta.env.BASE_URL}assets/rt_ldr.tza`),
+			);
+		}
+		try {
+			const unet = await this.unetPromise;
+			if (this.disposed) return;
+			this.unet = unet;
+			if (this.denoiseEnabled && (this.denoiseState === 'loading' || this.denoiseState === 'off')) {
+				this.denoiseState = 'ready';
+			}
+		} catch (err) {
+			console.error('Denoiser failed to initialize:', err);
+			this.unetPromise = null;
+			if (this.denoiseEnabled) this.denoiseState = 'error';
+		}
+	}
 
 	private emit(mode: RenderMode) {
 		this.onStatus?.({
 			mode,
 			samples: this.ready ? Math.floor(this.pathTracer.samples) : 0,
 			elapsedMs: performance.now() - this.lastResetAt,
+			denoise: this.denoiseState,
+			denoisedAt: this.denoisedAtSamples,
 		});
 	}
 
 	setPathTracingEnabled(enabled: boolean) {
 		this.pathTracer.enablePathTracing = enabled;
+		if (!enabled) this.hideDenoise();
 		if (enabled && this.ready) this.pathTracer.reset();
 	}
 
@@ -450,14 +575,22 @@ export class PathTracerLab {
 		this.renderer.setSize(width, height, false);
 		this.camera.aspect = width / height;
 		this.camera.updateProjectionMatrix();
+		this.hideDenoise();
 		if (this.ready) this.pathTracer.updateCamera();
 	}
 
 	savePNG(filename = 'pt-lab.png') {
 		if (!this.ready) return;
-		// Redraw, then capture in the same task so the buffer is still valid.
-		this.pathTracer.renderSample();
-		this.renderer.domElement.toBlob((blob) => {
+		// Save what's on screen: the denoised overlay when it's visible,
+		// otherwise a fresh capture of the accumulated render.
+		const showingDenoised =
+			this.denoiseCanvas && this.denoisedAtSamples > 0 && this.denoiseEnabled;
+		const source = showingDenoised ? this.denoiseCanvas! : this.renderer.domElement;
+		if (!showingDenoised) {
+			// Redraw, then capture in the same task so the buffer is still valid.
+			this.pathTracer.renderSample();
+		}
+		source.toBlob((blob) => {
 			if (!blob) return;
 			const url = URL.createObjectURL(blob);
 			const a = document.createElement('a');
@@ -471,6 +604,8 @@ export class PathTracerLab {
 	dispose() {
 		this.disposed = true;
 		cancelAnimationFrame(this.rafId);
+		this.abortDenoise?.();
+		this.unet?.dispose();
 		this.controls.dispose();
 		this.pathTracer.dispose();
 		this.renderer.dispose();

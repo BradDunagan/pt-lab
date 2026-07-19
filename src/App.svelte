@@ -3,7 +3,13 @@
 	import { PathTracerLab, type LabStatus } from './lib/pathtracer';
 
 	let lab = $state<PathTracerLab | null>(null);
-	let status = $state<LabStatus>({ mode: 'loading', samples: 0, elapsedMs: 0 });
+	let status = $state<LabStatus>({
+		mode: 'loading',
+		samples: 0,
+		elapsedMs: 0,
+		denoise: 'off',
+		denoisedAt: 0,
+	});
 
 	const SCENES = [
 		{ value: 'helmet', label: 'Helmet — HDR photo env' },
@@ -24,13 +30,22 @@
 	}
 
 	let pathTracingEnabled = $state(true);
+	let denoiseEnabled = $state(false);
 	let bounces = $state(5);
 	let renderScale = $state(1);
-	let maxSamples = $state(0);
 	let envIntensity = $state(1);
+
+	// Power-of-two stops: fine resolution at the low end (where denoising
+	// experiments live), coarse at the high end. 0 = unlimited.
+	const MAX_SAMPLES_STOPS = [0, 4, 8, 16, 32, 64, 128, 256, 512, 1024, 2048];
+	let maxSamplesIndex = $state(0);
+	const maxSamples = $derived(MAX_SAMPLES_STOPS[maxSamplesIndex]);
 
 	$effect(() => {
 		lab?.setPathTracingEnabled(pathTracingEnabled);
+	});
+	$effect(() => {
+		lab?.setDenoiseEnabled(denoiseEnabled);
 	});
 	$effect(() => {
 		lab?.setBounces(bounces);
@@ -48,6 +63,17 @@
 	const elapsed = $derived((status.elapsedMs / 1000).toFixed(1));
 	const converged = $derived(maxSamples > 0 && status.samples >= maxSamples);
 	const rendering = $derived(status.mode === 'pathtracing' || status.mode === 'raster');
+	const denoiseText = $derived(
+		{
+			off: '',
+			unsupported: 'needs WebGPU',
+			loading: 'loading model…',
+			ready: 'waiting',
+			denoising: 'running…',
+			denoised: `@ ${status.denoisedAt} samples`,
+			error: 'failed (see console)',
+		}[status.denoise],
+	);
 </script>
 
 <main>
@@ -71,6 +97,11 @@
 			Path tracing
 		</label>
 
+		<label class="toggle">
+			<input type="checkbox" bind:checked={denoiseEnabled} />
+			AI denoise
+		</label>
+
 		<label>
 			Bounces <span>{bounces}</span>
 			<input type="range" min="1" max="10" step="1" bind:value={bounces} />
@@ -83,7 +114,13 @@
 
 		<label>
 			Max samples <span>{maxSamples === 0 ? '∞' : maxSamples}</span>
-			<input type="range" min="0" max="2048" step="64" bind:value={maxSamples} />
+			<input
+				type="range"
+				min="0"
+				max={MAX_SAMPLES_STOPS.length - 1}
+				step="1"
+				bind:value={maxSamplesIndex}
+			/>
 		</label>
 
 		<label>
@@ -97,6 +134,9 @@
 			<div><span class="key">Mode</span><span>{status.mode}{converged ? ' · converged' : ''}</span></div>
 			<div><span class="key">Samples</span><span>{status.samples}</span></div>
 			<div><span class="key">Elapsed</span><span>{elapsed}s</span></div>
+			{#if status.denoise !== 'off'}
+				<div><span class="key">Denoise</span><span>{denoiseText}</span></div>
+			{/if}
 		</div>
 
 		<p class="hint">

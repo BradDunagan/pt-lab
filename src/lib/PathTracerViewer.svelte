@@ -4,7 +4,7 @@
 
 	let {
 		lab = $bindable(null),
-		status = $bindable({ mode: 'loading', samples: 0, elapsedMs: 0 }),
+		status = $bindable({ mode: 'loading', samples: 0, elapsedMs: 0, denoise: 'off', denoisedAt: 0 }),
 	}: {
 		lab: PathTracerLab | null;
 		status: LabStatus;
@@ -12,10 +12,12 @@
 
 	let container: HTMLDivElement;
 	let canvas: HTMLCanvasElement;
+	let denoiseCanvas: HTMLCanvasElement;
 
 	onMount(() => {
 		const instance = new PathTracerLab(canvas, {
 			onStatus: (s) => (status = s),
+			denoiseCanvas,
 		});
 		instance.resize(container.clientWidth, container.clientHeight);
 		instance.init();
@@ -38,6 +40,7 @@
 
 <div class="viewer" bind:this={container}>
 	<canvas bind:this={canvas}></canvas>
+	<canvas class="denoise" bind:this={denoiseCanvas}></canvas>
 	{#if status.mode === 'loading' || status.mode === 'building-bvh'}
 		<div class="overlay">
 			{status.mode === 'loading' ? 'Loading assets…' : 'Building BVH…'}
@@ -57,6 +60,14 @@
 		display: block;
 		width: 100%;
 		height: 100%;
+	}
+
+	canvas.denoise {
+		position: absolute;
+		inset: 0;
+		pointer-events: none;
+		opacity: 0;
+		transition: opacity 0.25s;
 	}
 
 	.overlay {

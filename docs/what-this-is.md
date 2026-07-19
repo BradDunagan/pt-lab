@@ -74,7 +74,7 @@ Progressive accumulation means clean output takes hundreds of samples. Practical
 - **Sample cap + UI feedback**: expose `pathTracer.samples` (the lab shows samples + elapsed time). Users tolerate waiting when they can see progress.
 - **`filterGlossyFactor`** (~0.5): blurs caustic-ish glossy paths slightly to kill fireflies at a small quality cost.
 - **`renderScale`**: converge at 0.5× for previews, 1× for finals.
-- **AI denoising (future)**: [oidn-web](https://github.com/pissang/oidn-web) runs Intel Open Image Denoise on WebGPU and can turn ~64 noisy samples into a clean image. It operates on the accumulated buffer as a post-pass — a natural fit behind the same abstraction.
+- **AI denoising**: the "AI denoise" checkbox runs [oidn-web](https://github.com/pissang/oidn-web) (Intel Open Image Denoise via tfjs/WebGPU — WebGPU-only). Implementation: the tone-mapped canvas is captured and denoised on a doubling schedule (4, 8, 16, … samples, plus a final pass at the sample cap), with the result drawn to a 2D overlay canvas that fades in over the live render; any accumulation reset hides it. `oidn-web` is dynamically imported on first enable (it pulls in tfjs), and the LDR weights live at `public/assets/rt_ldr.tza`. Denoising tone-mapped LDR is technically off-spec — OIDN prefers linear HDR input + albedo/normal aux buffers, which would mean reading the path tracer's float target before tone mapping — but it's dramatically effective on the emissive-room noise regardless. Save PNG exports the denoised overlay when it's showing.
 
 ### Other production caveats
 
