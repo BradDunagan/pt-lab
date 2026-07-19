@@ -5,6 +5,24 @@
 	let lab = $state<PathTracerLab | null>(null);
 	let status = $state<LabStatus>({ mode: 'loading', samples: 0, elapsedMs: 0 });
 
+	const SCENES = [
+		{ value: 'helmet', label: 'Helmet — HDR photo env' },
+		{ value: 'procedural', label: 'Primitives — HDR photo env' },
+		{ value: 'room', label: 'Room — baked HDR env' },
+		{ value: 'room-emissive', label: 'Room — emissive mesh' },
+		{ value: 'room-arealight', label: 'Room — rect area light' },
+	];
+	const currentScene = new URLSearchParams(location.search).get('scene') ?? 'helmet';
+
+	// Scene selection lives in the URL (?scene=...) so views are shareable;
+	// switching reloads the page, which rebuilds the whole scene and BVH anyway.
+	function changeScene(value: string) {
+		const url = new URL(location.href);
+		if (value === 'helmet') url.searchParams.delete('scene');
+		else url.searchParams.set('scene', value);
+		location.href = url.toString();
+	}
+
 	let pathTracingEnabled = $state(true);
 	let bounces = $state(5);
 	let renderScale = $state(1);
@@ -38,6 +56,15 @@
 	<aside>
 		<h1>pt-lab</h1>
 		<p class="subtitle">three.js + three-gpu-pathtracer</p>
+
+		<label>
+			Scene
+			<select value={currentScene} onchange={(e) => changeScene(e.currentTarget.value)}>
+				{#each SCENES as s (s.value)}
+					<option value={s.value}>{s.label}</option>
+				{/each}
+			</select>
+		</label>
 
 		<label class="toggle">
 			<input type="checkbox" bind:checked={pathTracingEnabled} />
@@ -140,6 +167,15 @@
 	input[type='range'] {
 		width: 100%;
 		accent-color: #7c6cf4;
+	}
+
+	select {
+		padding: 0.4rem;
+		border: 1px solid #3a3a45;
+		border-radius: 6px;
+		background: #22222b;
+		color: #eee;
+		font-size: 0.85rem;
 	}
 
 	input[type='checkbox'] {

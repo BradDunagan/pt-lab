@@ -23,6 +23,20 @@ This maps well onto "photo-realistic stills": let the tracer run for seconds-to-
 | `src/App.svelte` | Control panel + status readout (Svelte 5 runes). |
 | `public/assets/` | Demo model + HDR, served statically. |
 
+## Scenes
+
+A Scene selector in the sidebar (backed by the `?scene=` query param; switching reloads the page) chooses the experiment:
+
+| `?scene=` | Contents | Lighting |
+|---|---|---|
+| *(none)* | Damaged Helmet | HDR photo environment (Royal Esplanade) |
+| `procedural` | clearcoat knot, chrome + glass spheres | HDR photo environment |
+| `room` | 6×6×3 m room, table + red cube + gray ball | Room baked into a **generated** HDR env map; the light is a bright ceiling patch painted into it. Importance-sampled → converges fast, but direction-only: no parallax, and the light appears in the same direction from every point |
+| `room-emissive` | same | Room as real geometry; the light is an **emissive mesh**. Physically correct falloff/parallax/occlusion, but very noisy — the path tracer does not importance-sample emissive meshes, so rays find the light only by chance |
+| `room-arealight` | same | Room as real geometry; the light is a **`RectAreaLight`**, which the path tracer importance-samples → spatially correct *and* fast. Lights are invisible to rays in this pathtracer version, so the lamp's output is split 90/10 between the sampled light and a co-located emissive quad that makes the fixture visible |
+
+The room trio is a deliberate ladder — baked environment vs. emissive geometry vs. sampled light — demonstrating why production scenes model nearby lights as sampled light objects and reserve the environment map for distant surroundings. In the room scenes the Environment slider scales the lamp instead of an env map. `window.__lab` exposes the `PathTracerLab` instance for console/automation driving.
+
 ## Integration notes for the larger web app
 
 ### Keep the renderer behind an abstraction

@@ -20,6 +20,8 @@
 		instance.resize(container.clientWidth, container.clientHeight);
 		instance.init();
 		lab = instance;
+		// Debug hook for driving the viewer from the console or automation.
+		(window as unknown as { __lab?: PathTracerLab }).__lab = instance;
 
 		const observer = new ResizeObserver(() => {
 			instance.resize(container.clientWidth, container.clientHeight);
