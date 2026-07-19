@@ -12,6 +12,10 @@ dist
 dist-ssr
 *.local
 
+# Local reference material (Ray Tracing in One Weekend book source)
+docs/raytracing.github.io-release.zip
+docs/raytracing.github.io-release/
+
 # Editor directories and files
 .vscode/*
 !.vscode/extensions.json
