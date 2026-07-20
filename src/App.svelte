@@ -1,6 +1,6 @@
 <script lang="ts">
 	import PathTracerViewer from './lib/PathTracerViewer.svelte';
-	import { PathTracerLab, type LabStatus } from './lib/pathtracer';
+	import { PathTracerLab, type LabStatus, type LabObject } from './lib/pathtracer';
 
 	let lab = $state<PathTracerLab | null>(null);
 	let status = $state<LabStatus>({
@@ -23,6 +23,13 @@
 	const currentSceneLabel = SCENES.find((s) => s.value === currentScene)?.label ?? currentScene;
 
 	let editMode = $state(false);
+	let objects = $state<LabObject[]>([]);
+
+	$effect(() => {
+		if (!lab) return;
+		lab.setOnObjectsChanged((list) => (objects = list));
+		objects = lab.listObjects();
+	});
 
 	// Scene selection lives in the URL (?scene=...) so views are shareable;
 	// switching reloads the page, which rebuilds the whole scene and BVH anyway.
@@ -101,9 +108,32 @@
 		{#if editMode}
 			<div class="editor">
 				<div class="scene-name">{currentSceneLabel}</div>
+
+				<details class="group" open>
+					<summary>Objects</summary>
+					{#if objects.length === 0}
+						<p class="hint pad">No editable objects in this scene.</p>
+					{:else}
+						<ul class="object-list">
+							{#each objects as obj (obj.id)}
+								<li>
+									<label class="obj-row">
+										<input
+											type="checkbox"
+											checked={obj.included}
+											onchange={(e) => lab?.setObjectIncluded(obj.id, e.currentTarget.checked)}
+										/>
+										{obj.name}
+									</label>
+								</li>
+							{/each}
+						</ul>
+					{/if}
+				</details>
+
 				<p class="hint">
-					Scene Editor — fast raster preview (no path tracing). Orbit to inspect.
-					Object, material, and transform tools arrive in the next steps.
+					Fast raster preview (no path tracing). Toggle objects on/off; selection,
+					material, and transform tools come next.
 				</p>
 			</div>
 		{:else}
@@ -301,6 +331,49 @@
 		color: #f0f0f4;
 		font-weight: 600;
 		font-size: 0.9rem;
+	}
+
+	.group {
+		border: 1px solid #2a2a33;
+		border-radius: 6px;
+		background: #101016;
+	}
+
+	.group > summary {
+		padding: 0.5rem 0.75rem;
+		cursor: pointer;
+		font-size: 0.72rem;
+		font-weight: 600;
+		color: #aaa;
+		text-transform: uppercase;
+		letter-spacing: 0.05em;
+		user-select: none;
+	}
+
+	.group[open] > summary {
+		border-bottom: 1px solid #2a2a33;
+	}
+
+	.object-list {
+		list-style: none;
+		margin: 0;
+		padding: 0.6rem 0.75rem;
+		display: flex;
+		flex-direction: column;
+		gap: 0.4rem;
+	}
+
+	.obj-row {
+		flex-direction: row;
+		align-items: center;
+		gap: 0.5rem;
+		color: #ddd;
+		font-size: 0.85rem;
+		cursor: pointer;
+	}
+
+	.hint.pad {
+		padding: 0.6rem 0.75rem;
 	}
 
 	button:disabled {

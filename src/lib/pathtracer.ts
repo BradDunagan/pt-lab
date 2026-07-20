@@ -65,6 +65,14 @@ export interface LabOptions {
 	denoiseCanvas?: HTMLCanvasElement;
 }
 
+/** An editor-addressable object in the scene (plain data — no three.js types). */
+export interface LabObject {
+	id: string;
+	name: string;
+	/** Whether the object is part of the scene (unchecked = hidden). */
+	included: boolean;
+}
+
 const MODEL_URL = `${import.meta.env.BASE_URL}assets/damaged-helmet.glb`;
 const ENV_URL = `${import.meta.env.BASE_URL}assets/royal_esplanade_1k.hdr`;
 
@@ -118,6 +126,15 @@ export class PathTracerLab {
 	private editing = false;
 	private patchMat: MeshPhysicalMaterial | null = null;
 	private rectLight: RectAreaLight | null = null;
+
+	// Editor object registry. Keyed by a stable per-session id (decoupled from
+	// the display name so imported duplicates never collide).
+	private objects = new Map<string, { object3d: Object3D; name: string; included: boolean }>();
+	private objectCounter = 0;
+	private objectsChanged?: (objects: LabObject[]) => void;
+	// Set when the included-set changed while editing, so returning to render
+	// mode rebuilds the BVH (which drops now-hidden meshes via traverseVisible).
+	private objectsDirty = false;
 
 	private denoiseCanvas?: HTMLCanvasElement;
 	private captureCanvas = document.createElement('canvas');
@@ -223,6 +240,7 @@ export class PathTracerLab {
 		this.pathTracer.setScene(this.scene, this.camera);
 		this.ready = true;
 		this.lastResetAt = performance.now();
+		this.emitObjects();
 		this.loop();
 	}
 
@@ -274,19 +292,23 @@ export class PathTracerLab {
 		return group;
 	}
 
-	/** 2 x 1 m table at room center with a 10 cm red cube and a 5 cm gray ball. */
+	/**
+	 * 2 x 1 m table at room center with a 10 cm red cube and a 5 cm gray ball.
+	 * Each is registered as an individually addressable editor object; the
+	 * table's top and legs are grouped so they toggle/transform as one.
+	 */
 	private makeTableScene(): Object3D {
-		const group = new Group();
-		const tableMat = new MeshPhysicalMaterial({ color: 0x8a6a48, roughness: 0.6 });
+		const root = new Group();
 
+		const tableMat = new MeshPhysicalMaterial({ color: 0x8a6a48, roughness: 0.6 });
+		const table = new Group();
 		const top = new Mesh(new BoxGeometry(2, 0.05, 1), tableMat);
 		top.position.y = 0.725;
-		group.add(top);
-
+		table.add(top);
 		for (const [x, z] of [[-0.9, -0.4], [0.9, -0.4], [-0.9, 0.4], [0.9, 0.4]]) {
 			const leg = new Mesh(new BoxGeometry(0.06, 0.7, 0.06), tableMat);
 			leg.position.set(x, 0.35, z);
-			group.add(leg);
+			table.add(leg);
 		}
 
 		const cube = new Mesh(
@@ -294,16 +316,18 @@ export class PathTracerLab {
 			new MeshPhysicalMaterial({ color: 0xb01818, roughness: 0.4 }),
 		);
 		cube.position.set(-0.3, 0.8, 0);
-		group.add(cube);
 
 		const ball = new Mesh(
 			new SphereGeometry(0.05, 48, 24),
 			new MeshPhysicalMaterial({ color: 0xc8c8c8, roughness: 0.3 }),
 		);
 		ball.position.set(0.25, 0.8, 0.12);
-		group.add(ball);
 
-		return group;
+		this.registerObject(table, 'Table');
+		this.registerObject(cube, 'Cube');
+		this.registerObject(ball, 'Ball');
+		root.add(table, cube, ball);
+		return root;
 	}
 
 	/**
@@ -739,12 +763,47 @@ export class PathTracerLab {
 		if (edit) {
 			this.hideDenoise();
 		} else if (this.ready) {
-			// Returning to render mode: the scene may have changed while editing,
-			// so restart accumulation from a clean sample 0.
-			this.pathTracer.updateCamera();
-			this.pathTracer.reset();
+			if (this.objectsDirty) {
+				// The set of visible objects changed; rebuild the BVH (setScene
+				// skips hidden meshes and resets accumulation itself).
+				this.objectsDirty = false;
+				this.pathTracer.setScene(this.scene, this.camera);
+			} else {
+				this.pathTracer.updateCamera();
+				this.pathTracer.reset();
+			}
 			this.lastResetAt = performance.now();
 		}
+	}
+
+	private registerObject(object3d: Object3D, name: string) {
+		const id = `obj-${++this.objectCounter}`;
+		this.objects.set(id, { object3d, name, included: object3d.visible });
+	}
+
+	listObjects(): LabObject[] {
+		return [...this.objects.entries()].map(([id, e]) => ({
+			id,
+			name: e.name,
+			included: e.included,
+		}));
+	}
+
+	setObjectIncluded(id: string, included: boolean) {
+		const entry = this.objects.get(id);
+		if (!entry || entry.included === included) return;
+		entry.included = included;
+		entry.object3d.visible = included; // instant in the raster edit view
+		this.objectsDirty = true;
+		this.emitObjects();
+	}
+
+	setOnObjectsChanged(cb: (objects: LabObject[]) => void) {
+		this.objectsChanged = cb;
+	}
+
+	private emitObjects() {
+		this.objectsChanged?.(this.listObjects());
 	}
 
 	setBounces(bounces: number) {
