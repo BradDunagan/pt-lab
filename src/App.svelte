@@ -1,5 +1,6 @@
 <script lang="ts">
 	import PathTracerViewer from './lib/PathTracerViewer.svelte';
+	import TransformPanel from './lib/TransformPanel.svelte';
 	import { PathTracerLab, type LabStatus, type LabObject } from './lib/pathtracer';
 
 	let lab = $state<PathTracerLab | null>(null);
@@ -24,12 +25,20 @@
 
 	let editMode = $state(false);
 	let objects = $state<LabObject[]>([]);
+	let selectedId = $state<string | null>(null);
 
 	$effect(() => {
 		if (!lab) return;
 		lab.setOnObjectsChanged((list) => (objects = list));
 		objects = lab.listObjects();
 	});
+
+	const selectedName = $derived(objects.find((o) => o.id === selectedId)?.name ?? '');
+	// Recomputes only when the selection (or lab) changes — exactly when the
+	// TransformPanel should re-seed. Edits after that flow one-way to the lab.
+	const selectedTransform = $derived(
+		selectedId && lab ? lab.getObjectTransform(selectedId) : null,
+	);
 
 	// Scene selection lives in the URL (?scene=...) so views are shareable;
 	// switching reloads the page, which rebuilds the whole scene and BVH anyway.
@@ -116,24 +125,36 @@
 					{:else}
 						<ul class="object-list">
 							{#each objects as obj (obj.id)}
-								<li>
-									<label class="obj-row">
-										<input
-											type="checkbox"
-											checked={obj.included}
-											onchange={(e) => lab?.setObjectIncluded(obj.id, e.currentTarget.checked)}
-										/>
+								<li class="obj-row" class:selected={obj.id === selectedId}>
+									<input
+										type="checkbox"
+										checked={obj.included}
+										onchange={(e) => lab?.setObjectIncluded(obj.id, e.currentTarget.checked)}
+									/>
+									<button class="obj-name" onclick={() => (selectedId = obj.id)}>
 										{obj.name}
-									</label>
+									</button>
 								</li>
 							{/each}
 						</ul>
 					{/if}
 				</details>
 
+				{#if selectedId && selectedTransform}
+					<details class="group" open>
+						<summary>Transform — {selectedName}</summary>
+						{#key selectedId}
+							<TransformPanel
+								transform={selectedTransform}
+								onchange={(t) => selectedId && lab?.setObjectTransform(selectedId, t)}
+							/>
+						{/key}
+					</details>
+				{/if}
+
 				<p class="hint">
-					Fast raster preview (no path tracing). Toggle objects on/off; selection,
-					material, and transform tools come next.
+					Fast raster preview (no path tracing). Click a name to select and edit
+					its transform. Material tools come next.
 				</p>
 			</div>
 		{:else}
@@ -357,19 +378,44 @@
 	.object-list {
 		list-style: none;
 		margin: 0;
-		padding: 0.6rem 0.75rem;
+		padding: 0.5rem;
 		display: flex;
 		flex-direction: column;
-		gap: 0.4rem;
+		gap: 0.15rem;
 	}
 
 	.obj-row {
+		display: flex;
 		flex-direction: row;
 		align-items: center;
 		gap: 0.5rem;
+		padding: 0.25rem 0.35rem;
+		border-radius: 4px;
+	}
+
+	.obj-row.selected {
+		background: #2a2440;
+	}
+
+	.obj-name {
+		flex: 1;
+		text-align: left;
+		padding: 0.1rem 0.2rem;
+		border: none;
+		background: none;
 		color: #ddd;
 		font-size: 0.85rem;
 		cursor: pointer;
+	}
+
+	.obj-row.selected .obj-name {
+		color: #f0f0f4;
+		font-weight: 600;
+	}
+
+	.obj-name:hover {
+		color: #fff;
+		background: none;
 	}
 
 	.hint.pad {

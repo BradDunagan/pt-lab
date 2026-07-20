@@ -73,6 +73,16 @@ export interface LabObject {
 	included: boolean;
 }
 
+/** An object's transform, in editor-friendly units (meters, degrees, factor). */
+export interface LabTransform {
+	position: [number, number, number];
+	rotation: [number, number, number];
+	scale: [number, number, number];
+}
+
+const RAD2DEG = 180 / Math.PI;
+const DEG2RAD = Math.PI / 180;
+
 const MODEL_URL = `${import.meta.env.BASE_URL}assets/damaged-helmet.glb`;
 const ENV_URL = `${import.meta.env.BASE_URL}assets/royal_esplanade_1k.hdr`;
 
@@ -804,6 +814,28 @@ export class PathTracerLab {
 
 	private emitObjects() {
 		this.objectsChanged?.(this.listObjects());
+	}
+
+	getObjectTransform(id: string): LabTransform | null {
+		const entry = this.objects.get(id);
+		if (!entry) return null;
+		const o = entry.object3d;
+		return {
+			position: [o.position.x, o.position.y, o.position.z],
+			rotation: [o.rotation.x * RAD2DEG, o.rotation.y * RAD2DEG, o.rotation.z * RAD2DEG],
+			scale: [o.scale.x, o.scale.y, o.scale.z],
+		};
+	}
+
+	setObjectTransform(id: string, t: LabTransform) {
+		const entry = this.objects.get(id);
+		if (!entry) return;
+		const o = entry.object3d;
+		o.position.set(t.position[0], t.position[1], t.position[2]);
+		o.rotation.set(t.rotation[0] * DEG2RAD, t.rotation[1] * DEG2RAD, t.rotation[2] * DEG2RAD);
+		o.scale.set(t.scale[0], t.scale[1], t.scale[2]);
+		// Live in the raster view; the traced BVH refits on return to render.
+		this.objectsDirty = true;
 	}
 
 	setBounces(bounces: number) {
