@@ -9,6 +9,7 @@
 		elapsedMs: 0,
 		denoise: 'off',
 		denoisedAt: 0,
+		denoiseAux: true,
 	});
 
 	const SCENES = [
@@ -31,6 +32,7 @@
 
 	let pathTracingEnabled = $state(true);
 	let denoiseEnabled = $state(false);
+	let denoiseAuxEnabled = $state(true);
 	let bounces = $state(5);
 	let renderScale = $state(1);
 	let envIntensity = $state(1);
@@ -46,6 +48,9 @@
 	});
 	$effect(() => {
 		lab?.setDenoiseEnabled(denoiseEnabled);
+	});
+	$effect(() => {
+		lab?.setDenoiseAuxEnabled(denoiseAuxEnabled);
 	});
 	$effect(() => {
 		lab?.setBounces(bounces);
@@ -70,7 +75,7 @@
 			loading: 'loading model…',
 			ready: 'waiting',
 			denoising: 'running…',
-			denoised: `@ ${status.denoisedAt} samples`,
+			denoised: `@ ${status.denoisedAt} samples${status.denoiseAux ? ' · aux' : ''}`,
 			error: 'failed (see console)',
 		}[status.denoise],
 	);
@@ -100,6 +105,11 @@
 		<label class="toggle">
 			<input type="checkbox" bind:checked={denoiseEnabled} />
 			AI denoise
+		</label>
+
+		<label class="toggle sub">
+			<input type="checkbox" bind:checked={denoiseAuxEnabled} disabled={!denoiseEnabled} />
+			Albedo/normal aux
 		</label>
 
 		<label>
@@ -202,6 +212,17 @@
 		gap: 0.5rem;
 		color: #eee;
 		font-weight: 500;
+	}
+
+	.toggle.sub {
+		margin: -0.6rem 0 0 1.4rem;
+		font-weight: 400;
+		font-size: 0.8rem;
+		color: #bbb;
+	}
+
+	.toggle.sub:has(input:disabled) {
+		opacity: 0.4;
 	}
 
 	input[type='range'] {

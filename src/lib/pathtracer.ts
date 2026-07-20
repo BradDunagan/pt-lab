@@ -3,6 +3,7 @@ import {
 	Box3,
 	BoxGeometry,
 	CircleGeometry,
+	Color,
 	DataTexture,
 	EquirectangularReflectionMapping,
 	FloatType,
@@ -10,15 +11,21 @@ import {
 	LinearFilter,
 	LinearSRGBColorSpace,
 	Mesh,
+	MeshBasicMaterial,
+	MeshNormalMaterial,
 	MeshPhysicalMaterial,
+	NoToneMapping,
 	PerspectiveCamera,
 	PlaneGeometry,
 	RGBAFormat,
 	Scene,
 	SphereGeometry,
+	SRGBColorSpace,
 	TorusKnotGeometry,
 	Vector3,
 	WebGLRenderer,
+	WebGLRenderTarget,
+	type Material,
 	type Object3D,
 	type Texture,
 } from 'three';
@@ -48,6 +55,8 @@ export interface LabStatus {
 	denoise: DenoiseState;
 	/** Sample count the visible denoised image was computed from (0 = none). */
 	denoisedAt: number;
+	/** Whether denoising currently uses albedo/normal auxiliary buffers. */
+	denoiseAux: boolean;
 }
 
 export interface LabOptions {
@@ -113,11 +122,24 @@ export class PathTracerLab {
 	private captureCanvas = document.createElement('canvas');
 	private denoiseEnabled = false;
 	private denoiseState: DenoiseState = 'off';
-	private unet: UNet | null = null;
-	private unetPromise: Promise<UNet> | null = null;
 	private denoiseBusy = false;
 	private denoisedAtSamples = 0;
 	private abortDenoise: (() => void) | null = null;
+
+	// Two UNets: one trained on color only, one on color + albedo/normal aux
+	// buffers. They are mutually incompatible (an aux net requires the aux
+	// inputs, a plain net rejects them), so both are kept and loaded lazily.
+	private unetPlain: UNet | null = null;
+	private unetAux: UNet | null = null;
+	private unetPromises: { plain: Promise<UNet> | null; aux: Promise<UNet> | null } = {
+		plain: null,
+		aux: null,
+	};
+	private auxEnabled = true;
+	private auxAvailable = true;
+	private auxCache: { albedo: ImageData; normal: ImageData } | null = null;
+	private normalMaterial = new MeshNormalMaterial();
+	private basicMirrors = new WeakMap<Material, MeshBasicMaterial>();
 
 	constructor(canvas: HTMLCanvasElement, options: LabOptions = {}) {
 		this.onStatus = options.onStatus;
@@ -433,7 +455,8 @@ export class PathTracerLab {
 	 * so the drawing buffer is still valid to capture.
 	 */
 	private maybeDenoise() {
-		if (!this.denoiseEnabled || !this.unet || this.denoiseBusy) return;
+		const unet = this.denoiseEnabled ? this.activeUNet() : null;
+		if (!unet || this.denoiseBusy) return;
 		if (!this.pathTracer.enablePathTracing) return;
 		const samples = Math.floor(this.pathTracer.samples);
 		const paused = this.maxSamples > 0 && samples >= this.maxSamples;
@@ -445,6 +468,29 @@ export class PathTracerLab {
 		const src = this.renderer.domElement;
 		const overlay = this.denoiseCanvas;
 		if (!overlay || src.width === 0 || src.height === 0) return;
+
+		// The aux buffers only change on camera/scene changes, which all reset
+		// accumulation (invalidating the cache via hideDenoise) — so capture
+		// once per accumulation cycle and reuse.
+		let aux: { albedo: ImageData; normal: ImageData } | null = null;
+		if (unet === this.unetAux) {
+			try {
+				if (
+					!this.auxCache ||
+					this.auxCache.albedo.width !== src.width ||
+					this.auxCache.albedo.height !== src.height
+				) {
+					this.auxCache = this.captureAuxBuffers(src.width, src.height);
+				}
+				aux = this.auxCache;
+			} catch (err) {
+				console.warn('Aux buffer capture failed; falling back to color-only denoising:', err);
+				this.auxAvailable = false;
+				this.auxCache = null;
+				void this.prepareUNet();
+				return;
+			}
+		}
 
 		this.denoiseBusy = true;
 		this.denoiseState = 'denoising';
@@ -461,8 +507,9 @@ export class PathTracerLab {
 		}
 		const octx = overlay.getContext('2d')!;
 
-		this.abortDenoise = this.unet.tileExecute({
+		this.abortDenoise = unet.tileExecute({
 			color: image,
+			...(aux ? { albedo: aux.albedo, normal: aux.normal } : {}),
 			progress: (_out, tileData, tile) => {
 				if (tileData) octx.putImageData(tileData, tile.x, tile.y);
 				overlay.style.opacity = '1';
@@ -482,6 +529,7 @@ export class PathTracerLab {
 		this.abortDenoise = null;
 		this.denoiseBusy = false;
 		this.denoisedAtSamples = 0;
+		this.auxCache = null;
 		if (this.denoiseCanvas) this.denoiseCanvas.style.opacity = '0';
 		if (this.denoiseState === 'denoising' || this.denoiseState === 'denoised') {
 			this.denoiseState = 'ready';
@@ -499,25 +547,160 @@ export class PathTracerLab {
 			this.denoiseState = 'unsupported';
 			return;
 		}
-		if (!this.unetPromise) {
-			this.denoiseState = 'loading';
+		await this.prepareUNet();
+	}
+
+	setDenoiseAuxEnabled(enabled: boolean) {
+		if (this.auxEnabled === enabled) return;
+		this.auxEnabled = enabled;
+		this.auxCache = null;
+		if (!this.denoiseEnabled) return;
+		// Drop the current overlay and re-denoise with the newly selected net.
+		this.hideDenoise();
+		void this.prepareUNet();
+	}
+
+	/** The net matching the current aux preference, if loaded. */
+	private activeUNet(): UNet | null {
+		return this.auxEnabled && this.auxAvailable ? this.unetAux : this.unetPlain;
+	}
+
+	/** Load (if needed) the net matching the current aux preference. */
+	private async prepareUNet() {
+		const wantAux = this.auxEnabled && this.auxAvailable;
+		if (!this.activeUNet()) this.denoiseState = 'loading';
+		let unet = await this.ensureUNet(wantAux);
+		if (this.disposed) return;
+		// Aux weights failed to load: auxAvailable is now false; fall back.
+		if (!unet && wantAux) unet = await this.ensureUNet(false);
+		if (this.disposed || !unet) return;
+		if (this.denoiseEnabled && (this.denoiseState === 'loading' || this.denoiseState === 'off')) {
+			this.denoiseState = 'ready';
+		}
+	}
+
+	private async ensureUNet(aux: boolean): Promise<UNet | null> {
+		const key = aux ? 'aux' : 'plain';
+		if (!this.unetPromises[key]) {
 			// Lazy: oidn-web pulls in tfjs, so only load it on first use.
-			this.unetPromise = import('oidn-web').then(({ initUNetFromURL }) =>
-				initUNetFromURL(`${import.meta.env.BASE_URL}assets/rt_ldr.tza`),
+			this.unetPromises[key] = import('oidn-web').then(({ initUNetFromURL }) =>
+				initUNetFromURL(
+					`${import.meta.env.BASE_URL}assets/${aux ? 'rt_ldr_alb_nrm' : 'rt_ldr'}.tza`,
+					undefined,
+					aux ? { aux: true } : undefined,
+				),
 			);
 		}
 		try {
-			const unet = await this.unetPromise;
-			if (this.disposed) return;
-			this.unet = unet;
-			if (this.denoiseEnabled && (this.denoiseState === 'loading' || this.denoiseState === 'off')) {
-				this.denoiseState = 'ready';
-			}
+			const unet = await this.unetPromises[key]!;
+			if (this.disposed) return null;
+			if (aux) this.unetAux = unet;
+			else this.unetPlain = unet;
+			return unet;
 		} catch (err) {
+			this.unetPromises[key] = null;
+			if (aux) {
+				console.warn('Aux denoiser weights failed to load; falling back to color-only:', err);
+				this.auxAvailable = false;
+				return null;
+			}
 			console.error('Denoiser failed to initialize:', err);
-			this.unetPromise = null;
 			if (this.denoiseEnabled) this.denoiseState = 'error';
+			return null;
 		}
+	}
+
+	/**
+	 * Render noise-free albedo and normal passes of the current view — the
+	 * denoiser's auxiliary inputs. They act as an edge map: the net sees where
+	 * real material/geometry boundaries are even when the color input is pure
+	 * noise. Albedo = per-mesh unlit base color (background white, per OIDN
+	 * convention); normal = packed view-space normals from MeshNormalMaterial,
+	 * whose 0.5*n+0.5 encoding is exactly what oidn-web expects (background =
+	 * packed zero normal, 0x808080).
+	 */
+	private captureAuxBuffers(width: number, height: number): { albedo: ImageData; normal: ImageData } {
+		const renderer = this.renderer;
+		const prevToneMapping = renderer.toneMapping;
+		const prevBackground = this.scene.background;
+		const prevAutoClear = renderer.autoClear;
+		const prevClearColor = renderer.getClearColor(new Color());
+		const prevClearAlpha = renderer.getClearAlpha();
+
+		renderer.toneMapping = NoToneMapping;
+		this.scene.background = null;
+		renderer.autoClear = true;
+
+		// Render targets draw in linear working space regardless of the
+		// renderer's output color space; an SRGB texture makes the GPU encode
+		// on write so the readback matches the sRGB color capture. Normals
+		// stay linear — their packing must not be gamma-encoded.
+		const albedoRT = new WebGLRenderTarget(width, height);
+		albedoRT.texture.colorSpace = SRGBColorSpace;
+		const normalRT = new WebGLRenderTarget(width, height);
+
+		try {
+			// Albedo: swap every mesh's material for an unlit mirror of its base
+			// color/map. (scene.overrideMaterial can't carry per-object colors.)
+			const swapped: [Mesh, Material | Material[]][] = [];
+			this.scene.traverse((obj) => {
+				const mesh = obj as Mesh;
+				if (!mesh.isMesh) return;
+				const source = (Array.isArray(mesh.material) ? mesh.material[0] : mesh.material) as
+					| MeshPhysicalMaterial
+					| MeshBasicMaterial;
+				let mirror = this.basicMirrors.get(source);
+				if (!mirror) {
+					mirror = new MeshBasicMaterial();
+					this.basicMirrors.set(source, mirror);
+				}
+				if (source.color) mirror.color.copy(source.color);
+				const map = source.map ?? null;
+				if (mirror.map !== map) {
+					mirror.map = map;
+					mirror.needsUpdate = true;
+				}
+				swapped.push([mesh, mesh.material]);
+				mesh.material = mirror;
+			});
+			renderer.setClearColor(0xffffff, 1);
+			renderer.setRenderTarget(albedoRT);
+			renderer.render(this.scene, this.camera);
+			for (const [mesh, material] of swapped) mesh.material = material;
+
+			// Normals: a global override works — normals ignore per-object color.
+			this.scene.overrideMaterial = this.normalMaterial;
+			renderer.setClearColor(0x808080, 1);
+			renderer.setRenderTarget(normalRT);
+			renderer.render(this.scene, this.camera);
+			this.scene.overrideMaterial = null;
+
+			return {
+				albedo: this.readTargetPixels(albedoRT, width, height),
+				normal: this.readTargetPixels(normalRT, width, height),
+			};
+		} finally {
+			this.scene.overrideMaterial = null;
+			renderer.setRenderTarget(null);
+			renderer.setClearColor(prevClearColor, prevClearAlpha);
+			renderer.toneMapping = prevToneMapping;
+			renderer.autoClear = prevAutoClear;
+			this.scene.background = prevBackground;
+			albedoRT.dispose();
+			normalRT.dispose();
+		}
+	}
+
+	/** Read back a render target, flipping rows (GL is bottom-up, ImageData top-down). */
+	private readTargetPixels(rt: WebGLRenderTarget, width: number, height: number): ImageData {
+		const buf = new Uint8Array(width * height * 4);
+		this.renderer.readRenderTargetPixels(rt, 0, 0, width, height, buf);
+		const flipped = new Uint8ClampedArray(width * height * 4);
+		const row = width * 4;
+		for (let y = 0; y < height; y++) {
+			flipped.set(buf.subarray((height - 1 - y) * row, (height - y) * row), y * row);
+		}
+		return new ImageData(flipped, width, height);
 	}
 
 	private emit(mode: RenderMode) {
@@ -527,6 +710,7 @@ export class PathTracerLab {
 			elapsedMs: performance.now() - this.lastResetAt,
 			denoise: this.denoiseState,
 			denoisedAt: this.denoisedAtSamples,
+			denoiseAux: this.auxEnabled && this.auxAvailable,
 		});
 	}
 
@@ -605,7 +789,9 @@ export class PathTracerLab {
 		this.disposed = true;
 		cancelAnimationFrame(this.rafId);
 		this.abortDenoise?.();
-		this.unet?.dispose();
+		this.unetPlain?.dispose();
+		this.unetAux?.dispose();
+		this.normalMaterial.dispose();
 		this.controls.dispose();
 		this.pathTracer.dispose();
 		this.renderer.dispose();

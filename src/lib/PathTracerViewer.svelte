@@ -4,7 +4,14 @@
 
 	let {
 		lab = $bindable(null),
-		status = $bindable({ mode: 'loading', samples: 0, elapsedMs: 0, denoise: 'off', denoisedAt: 0 }),
+		status = $bindable({
+			mode: 'loading',
+			samples: 0,
+			elapsedMs: 0,
+			denoise: 'off',
+			denoisedAt: 0,
+			denoiseAux: true,
+		}),
 	}: {
 		lab: PathTracerLab | null;
 		status: LabStatus;
