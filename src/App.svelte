@@ -85,6 +85,29 @@
 	let editMode = $state(false);
 	let objects = $state<LabObject[]>([]);
 	let selectedId = $state<string | null>(null);
+	let importError = $state('');
+	let fileInput = $state<HTMLInputElement>();
+
+	async function onImportFile(e: Event) {
+		const input = e.currentTarget as HTMLInputElement;
+		const file = input.files?.[0];
+		if (!file || !lab) return;
+		importError = '';
+		try {
+			await lab.importGLB(await file.arrayBuffer(), file.name);
+		} catch (err) {
+			importError =
+				err instanceof DOMException && err.name === 'QuotaExceededError'
+					? 'Storage full — delete some scenes or objects.'
+					: 'Import failed — is it a valid .glb?';
+		}
+		input.value = '';
+	}
+
+	function removeObject(id: string) {
+		if (selectedId === id) selectedId = null;
+		lab?.removeLibraryObject(id);
+	}
 
 	const ROOM_OPTIONS: { value: RoomKind; label: string }[] = [
 		{ value: 'room', label: 'Baked HDR env' },
@@ -243,9 +266,7 @@
 
 				<details class="group" open>
 					<summary>Objects</summary>
-					{#if objects.length === 0}
-						<p class="hint pad">No editable objects in this scene.</p>
-					{:else}
+					{#if objects.length}
 						<ul class="object-list">
 							{#each objects as obj (obj.id)}
 								<li class="obj-row" class:selected={obj.id === selectedId}>
@@ -257,11 +278,33 @@
 									<button class="obj-name" onclick={() => (selectedId = obj.id)}>
 										{obj.name}
 									</button>
+									{#if obj.removable}
+										<button
+											class="obj-remove"
+											title="Remove from library"
+											onclick={() => removeObject(obj.id)}
+										>
+											×
+										</button>
+									{/if}
 								</li>
 							{/each}
 						</ul>
+					{:else}
+						<p class="hint pad">No objects yet — import one below.</p>
 					{/if}
+					<div class="obj-import">
+						<button class="editor-btn" onclick={() => fileInput?.click()}>Import .glb…</button>
+						{#if importError}<p class="hint error">{importError}</p>{/if}
+					</div>
 				</details>
+				<input
+					type="file"
+					accept=".glb,.gltf"
+					bind:this={fileInput}
+					onchange={onImportFile}
+					hidden
+				/>
 
 				{#if selectedId && selectedMaterial}
 					<details class="group" open>
@@ -614,8 +657,37 @@
 		background: none;
 	}
 
+	.obj-row .obj-remove {
+		padding: 0 0.3rem;
+		border: none;
+		background: none;
+		color: #888;
+		font-size: 1.1rem;
+		line-height: 1;
+		cursor: pointer;
+	}
+
+	.obj-row .obj-remove:hover {
+		color: #e77;
+		background: none;
+	}
+
+	.obj-import {
+		padding: 0.5rem 0.75rem;
+		border-top: 1px solid #2a2a33;
+	}
+
+	.obj-import .editor-btn {
+		width: 100%;
+	}
+
 	.hint.pad {
 		padding: 0.6rem 0.75rem;
+	}
+
+	.hint.error {
+		color: #e88;
+		padding-top: 0.5rem;
 	}
 
 	button:disabled {

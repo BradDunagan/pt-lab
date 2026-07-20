@@ -37,6 +37,13 @@ import { HDRLoader } from 'three/addons/loaders/HDRLoader.js';
 import { RectAreaLightUniformsLib } from 'three/addons/lights/RectAreaLightUniformsLib.js';
 import { WebGLPathTracer } from 'three-gpu-pathtracer';
 import type { UNet } from 'oidn-web';
+import {
+	listImports,
+	saveImport,
+	deleteImport,
+	arrayBufferToBase64,
+	base64ToArrayBuffer,
+} from './library-store';
 
 export type RenderMode = 'loading' | 'building-bvh' | 'raster' | 'pathtracing' | 'editing';
 
@@ -72,7 +79,22 @@ export interface LabObject {
 	name: string;
 	/** Whether the object is part of the scene (unchecked = hidden). */
 	included: boolean;
+	/** Imported objects can be removed from the library; built-ins cannot. */
+	removable: boolean;
 }
+
+/** An entry in the object library (a built-in primitive or an imported model). */
+interface LibraryItem {
+	key: string;
+	name: string;
+	kind: 'builtin' | 'imported';
+}
+
+const BUILTIN_LIBRARY: LibraryItem[] = [
+	{ key: 'Table', name: 'Table', kind: 'builtin' },
+	{ key: 'Cube', name: 'Cube', kind: 'builtin' },
+	{ key: 'Ball', name: 'Ball', kind: 'builtin' },
+];
 
 /** An object's transform, in editor-friendly units (meters, degrees, factor). */
 export interface LabTransform {
@@ -95,8 +117,10 @@ export interface LabMaterial {
 export interface SceneObjectState {
 	key: string; // stable library key (the object's name for built-ins)
 	included: boolean;
-	material: LabMaterial;
-	transform: LabTransform;
+	// Absent means "use the object's factory default" (how demos include
+	// built-ins without duplicating their default look/placement).
+	material?: LabMaterial;
+	transform?: LabTransform;
 }
 
 /** A saved editor scene: room + per-object state + camera. */
@@ -132,6 +156,20 @@ function disposeObject(obj: Object3D) {
 
 export type RoomKind = 'room' | 'room-emissive' | 'room-arealight';
 const ROOM_KINDS = ['room', 'room-emissive', 'room-arealight'];
+
+/** A built-in room demo expressed as editor-scene data (room + the 3 built-ins). */
+function demoRoomData(room: RoomKind): SceneData {
+	return {
+		version: 1,
+		room,
+		objects: [
+			{ key: 'Table', included: true },
+			{ key: 'Cube', included: true },
+			{ key: 'Ball', included: true },
+		],
+		camera: { position: [2.2, 1.3, 2.6], target: [0, 0.7, 0] },
+	};
+}
 
 // Room scene: a 6 x 6 m room with a 3 m ceiling, lit by a bright ceiling
 // patch. Three variants: 'room' bakes the room into a generated HDR
@@ -190,6 +228,12 @@ export class PathTracerLab {
 	>();
 	private objectCounter = 0;
 	private objectsChanged?: (objects: LabObject[]) => void;
+
+	// The object library: built-in primitives plus imported models. Imports are
+	// parsed once into a template Object3D that scenes clone.
+	private library: LibraryItem[] = [...BUILTIN_LIBRARY];
+	private importTemplates = new Map<string, Object3D>();
+	private importCounter = 0;
 	// Set when the included-set or a transform changed while editing, so
 	// returning to render rebuilds the BVH (drops hidden meshes via
 	// traverseVisible; refits for moved geometry).
@@ -258,37 +302,36 @@ export class PathTracerLab {
 
 		const kind = sceneParam();
 		const isRoom = ROOM_KINDS.includes(kind ?? '');
-		const [hdrEnv, model] = await Promise.all([
-			isRoom ? Promise.resolve<Texture | null>(null) : new HDRLoader().loadAsync(ENV_URL),
-			this.loadModel(),
-		]);
+
+		// Parse persisted imports into templates before building anything.
+		await this.loadImports();
 		if (this.disposed) return;
 
 		if (isRoom) {
-			// Build the room's shell or baked environment (runtime-swappable).
-			this.applyRoom(kind as RoomKind);
-		} else if (hdrEnv) {
+			// A room demo is just a pre-populated editor scene.
+			this.buildEditorScene(demoRoomData(kind as RoomKind));
+		} else {
+			const [hdrEnv, model] = await Promise.all([
+				new HDRLoader().loadAsync(ENV_URL),
+				this.loadModel(),
+			]);
+			if (this.disposed) return;
 			hdrEnv.mapping = EquirectangularReflectionMapping;
 			this.scene.environment = hdrEnv;
 			this.scene.background = hdrEnv;
+			this.scene.add(model);
+
+			const bounds = new Box3().setFromObject(model);
+			const size = bounds.getSize(new Vector3());
+			this.controls.target.set(0, size.y / 2, 0);
+			this.controls.update();
+
+			const floor = new Mesh(
+				new CircleGeometry(Math.max(size.x, size.z) * 3, 64).rotateX(-Math.PI / 2),
+				new MeshPhysicalMaterial({ color: 0xdedede, roughness: 0.85 }),
+			);
+			this.scene.add(floor);
 		}
-
-		this.scene.add(model);
-
-		const bounds = new Box3().setFromObject(model);
-		const size = bounds.getSize(new Vector3());
-		this.controls.target.set(0, size.y / 2, 0);
-		this.controls.update();
-
-		const floor = new Mesh(
-			isRoom
-				? // Real floor matching the room footprint; walls/ceiling exist only
-					// in the environment map.
-					new PlaneGeometry(ROOM_HALF * 2, ROOM_HALF * 2).rotateX(-Math.PI / 2)
-				: new CircleGeometry(Math.max(size.x, size.z) * 3, 64).rotateX(-Math.PI / 2),
-			new MeshPhysicalMaterial({ color: isRoom ? 0x8c8c8c : 0xdedede, roughness: 0.85 }),
-		);
-		this.scene.add(floor);
 
 		this.emit('building-bvh');
 		// Yield a frame so the status paints before the synchronous BVH build.
@@ -303,9 +346,7 @@ export class PathTracerLab {
 	}
 
 	private async loadModel(): Promise<Object3D> {
-		const kind = sceneParam();
-		if (kind === 'procedural') return this.makeProceduralScene();
-		if (ROOM_KINDS.includes(kind ?? '')) return this.makeTableScene();
+		if (sceneParam() === 'procedural') return this.makeProceduralScene();
 		try {
 			const gltf = await new GLTFLoader().loadAsync(MODEL_URL);
 			const model = gltf.scene;
@@ -350,42 +391,80 @@ export class PathTracerLab {
 		return group;
 	}
 
-	/**
-	 * 2 x 1 m table at room center with a 10 cm red cube and a 5 cm gray ball.
-	 * Each is registered as an individually addressable editor object; the
-	 * table's top and legs are grouped so they toggle/transform as one.
-	 */
-	private makeTableScene(): Object3D {
-		const root = new Group();
-
-		const tableMat = new MeshPhysicalMaterial({ color: 0x8a6a48, roughness: 0.6 });
+	/** 2 x 1 m table: top + four legs grouped so they move as one. */
+	private makeTable(): Object3D {
+		const mat = new MeshPhysicalMaterial({ color: 0x8a6a48, roughness: 0.6 });
 		const table = new Group();
-		const top = new Mesh(new BoxGeometry(2, 0.05, 1), tableMat);
+		const top = new Mesh(new BoxGeometry(2, 0.05, 1), mat);
 		top.position.y = 0.725;
 		table.add(top);
 		for (const [x, z] of [[-0.9, -0.4], [0.9, -0.4], [-0.9, 0.4], [0.9, 0.4]]) {
-			const leg = new Mesh(new BoxGeometry(0.06, 0.7, 0.06), tableMat);
+			const leg = new Mesh(new BoxGeometry(0.06, 0.7, 0.06), mat);
 			leg.position.set(x, 0.35, z);
 			table.add(leg);
 		}
+		return table;
+	}
 
+	private makeCube(): Object3D {
 		const cube = new Mesh(
 			new BoxGeometry(0.1, 0.1, 0.1),
 			new MeshPhysicalMaterial({ color: 0xb01818, roughness: 0.4 }),
 		);
 		cube.position.set(-0.3, 0.8, 0);
+		return cube;
+	}
 
+	private makeBall(): Object3D {
 		const ball = new Mesh(
 			new SphereGeometry(0.05, 48, 24),
 			new MeshPhysicalMaterial({ color: 0xc8c8c8, roughness: 0.3 }),
 		);
 		ball.position.set(0.25, 0.8, 0.12);
+		return ball;
+	}
 
-		this.registerObject(table, 'Table');
-		this.registerObject(cube, 'Cube');
-		this.registerObject(ball, 'Ball');
-		root.add(table, cube, ball);
-		return root;
+	private builtinFactory(key: string): (() => Object3D) | null {
+		switch (key) {
+			case 'Table':
+				return () => this.makeTable();
+			case 'Cube':
+				return () => this.makeCube();
+			case 'Ball':
+				return () => this.makeBall();
+			default:
+				return null;
+		}
+	}
+
+	/** Instantiate every library object into the scene, hidden by default. */
+	private instantiateLibrary() {
+		for (const item of this.library) {
+			let obj: Object3D | null = null;
+			if (item.kind === 'builtin') {
+				obj = this.builtinFactory(item.key)?.() ?? null;
+			} else {
+				const tmpl = this.importTemplates.get(item.key);
+				if (tmpl) obj = this.cloneWithMaterials(tmpl);
+			}
+			if (!obj) continue;
+			obj.visible = false;
+			this.registerObject(obj, item.name, item.key);
+			this.scene.add(obj);
+		}
+	}
+
+	/** Clone an object with its own material copies (per-scene edits stay local). */
+	private cloneWithMaterials(source: Object3D): Object3D {
+		const obj = source.clone();
+		obj.traverse((child) => {
+			const mesh = child as Mesh;
+			if (!mesh.isMesh || !mesh.material) return;
+			mesh.material = Array.isArray(mesh.material)
+				? mesh.material.map((m) => m.clone())
+				: mesh.material.clone();
+		});
+		return obj;
 	}
 
 	/**
@@ -850,6 +929,7 @@ export class PathTracerLab {
 			id,
 			name: e.name,
 			included: e.included,
+			removable: this.library.find((i) => i.key === e.key)?.kind === 'imported',
 		}));
 	}
 
@@ -1047,6 +1127,78 @@ export class PathTracerLab {
 		};
 	}
 
+	/** Parse each persisted import into a reusable template Object3D. */
+	private async loadImports() {
+		for (const rec of listImports()) {
+			try {
+				const template = await this.parseGLB(base64ToArrayBuffer(rec.glbBase64));
+				this.importTemplates.set(rec.key, template);
+				this.library.push({ key: rec.key, name: rec.name, kind: 'imported' });
+			} catch (err) {
+				console.warn('Failed to load imported object:', rec.name, err);
+			}
+		}
+	}
+
+	private async parseGLB(buffer: ArrayBuffer): Promise<Object3D> {
+		const gltf = await new GLTFLoader().parseAsync(buffer, '');
+		const model = gltf.scene;
+		// Center on origin, resting on the floor; wrap in a group so the
+		// object's own transform starts at identity (clean for the inspector).
+		const bounds = new Box3().setFromObject(model);
+		const center = bounds.getCenter(new Vector3());
+		model.position.set(-center.x, -bounds.min.y, -center.z);
+		const group = new Group();
+		group.add(model);
+		return group;
+	}
+
+	/** Import a .glb into the library (persisted) and add it to the scene. */
+	async importGLB(buffer: ArrayBuffer, filename: string): Promise<void> {
+		const template = await this.parseGLB(buffer);
+		const key = `import-${Date.now().toString(36)}-${this.importCounter++}`;
+		const name = filename.replace(/\.(glb|gltf)$/i, '').trim() || 'Imported';
+		// Persist first so a quota failure aborts before we mutate state.
+		saveImport({ key, name, glbBase64: arrayBufferToBase64(buffer) });
+		this.importTemplates.set(key, template);
+		this.library.push({ key, name, kind: 'imported' });
+
+		// Add an instance (hidden) so it appears in the list immediately.
+		const obj = this.cloneWithMaterials(template);
+		obj.visible = false;
+		this.registerObject(obj, name, key);
+		this.scene.add(obj);
+		this.objectsDirty = true;
+		this.emitObjects();
+	}
+
+	/** Remove an imported object from the library (built-ins are permanent). */
+	deleteLibraryItem(key: string) {
+		const item = this.library.find((i) => i.key === key);
+		if (!item || item.kind !== 'imported') return;
+		this.library = this.library.filter((i) => i.key !== key);
+		const template = this.importTemplates.get(key);
+		if (template) {
+			disposeObject(template);
+			this.importTemplates.delete(key);
+		}
+		deleteImport(key);
+		for (const [id, entry] of [...this.objects]) {
+			if (entry.key === key) {
+				this.scene.remove(entry.object3d);
+				disposeObject(entry.object3d);
+				this.objects.delete(id);
+			}
+		}
+		this.objectsDirty = true;
+		this.emitObjects();
+	}
+
+	removeLibraryObject(id: string) {
+		const entry = this.objects.get(id);
+		if (entry) this.deleteLibraryItem(entry.key);
+	}
+
 	/** Replace the whole scene with a saved (or new) editor scene. */
 	applyScene(data: SceneData) {
 		if (!this.ready) return;
@@ -1092,8 +1244,8 @@ export class PathTracerLab {
 		);
 		this.scene.add(floor);
 
-		// The object library (registers Table, Cube, Ball).
-		this.scene.add(this.makeTableScene());
+		// Instantiate the whole library (built-ins + imports), then apply state.
+		this.instantiateLibrary();
 		this.applyRoom(data.room);
 
 		for (const [id, entry] of this.objects) {
@@ -1101,10 +1253,8 @@ export class PathTracerLab {
 			const included = saved?.included ?? false;
 			entry.included = included;
 			entry.object3d.visible = included;
-			if (saved) {
-				this.setObjectMaterial(id, saved.material);
-				this.setObjectTransform(id, saved.transform);
-			}
+			if (saved?.material) this.setObjectMaterial(id, saved.material);
+			if (saved?.transform) this.setObjectTransform(id, saved.transform);
 		}
 
 		if (data.camera) {
