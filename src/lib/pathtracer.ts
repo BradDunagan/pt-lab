@@ -102,6 +102,19 @@ function sceneParam(): string | null {
 	return new URLSearchParams(location.search).get('scene');
 }
 
+/** Dispose every geometry and material under an object before discarding it. */
+function disposeObject(obj: Object3D) {
+	obj.traverse((child) => {
+		const mesh = child as Mesh;
+		if (!mesh.isMesh) return;
+		mesh.geometry?.dispose();
+		const mat = mesh.material;
+		if (Array.isArray(mat)) mat.forEach((m) => m.dispose());
+		else mat?.dispose();
+	});
+}
+
+export type RoomKind = 'room' | 'room-emissive' | 'room-arealight';
 const ROOM_KINDS = ['room', 'room-emissive', 'room-arealight'];
 
 // Room scene: a 6 x 6 m room with a 3 m ceiling, lit by a bright ceiling
@@ -147,6 +160,11 @@ export class PathTracerLab {
 	private editing = false;
 	private patchMat: MeshPhysicalMaterial | null = null;
 	private rectLight: RectAreaLight | null = null;
+	// Current room and its swappable pieces (shell geometry or baked env map).
+	private roomKind: RoomKind | null = null;
+	private roomShell: Object3D | null = null;
+	private roomEnvTex: DataTexture | null = null;
+	private envIntensity = 1;
 
 	// Editor object registry. Keyed by a stable per-session id (decoupled from
 	// the display name so imported duplicates never collide).
@@ -218,25 +236,19 @@ export class PathTracerLab {
 
 		const kind = sceneParam();
 		const isRoom = ROOM_KINDS.includes(kind ?? '');
-		const geometricRoom = kind === 'room-emissive' || kind === 'room-arealight';
-		const [envMap, model] = await Promise.all([
-			kind === 'room'
-				? Promise.resolve<Texture | null>(this.makeRoomEnvironment())
-				: geometricRoom
-					? Promise.resolve<Texture | null>(null)
-					: new HDRLoader().loadAsync(ENV_URL),
+		const [hdrEnv, model] = await Promise.all([
+			isRoom ? Promise.resolve<Texture | null>(null) : new HDRLoader().loadAsync(ENV_URL),
 			this.loadModel(),
 		]);
 		if (this.disposed) return;
 
-		if (envMap) {
-			envMap.mapping = EquirectangularReflectionMapping;
-			this.scene.environment = envMap;
-			this.scene.background = envMap;
-		} else {
-			// Geometric room: no environment at all — the only light in the
-			// scene is the ceiling patch in the room shell.
-			this.scene.add(this.makeRoomShell(kind === 'room-arealight'));
+		if (isRoom) {
+			// Build the room's shell or baked environment (runtime-swappable).
+			this.applyRoom(kind as RoomKind);
+		} else if (hdrEnv) {
+			hdrEnv.mapping = EquirectangularReflectionMapping;
+			this.scene.environment = hdrEnv;
+			this.scene.background = hdrEnv;
 		}
 
 		this.scene.add(model);
@@ -916,6 +928,10 @@ export class PathTracerLab {
 	}
 
 	setEnvironmentIntensity(intensity: number) {
+		this.envIntensity = intensity;
+		// In edit mode we only update the light objects (the raster view reads
+		// them directly); the tracer resyncs on return to render.
+		const syncTracer = this.ready && !this.editing;
 		if (this.patchMat) {
 			// The geometric rooms have no environment; the slider scales the lamp
 			// (both halves of the split, in the arealight room).
@@ -925,13 +941,68 @@ export class PathTracerLab {
 				: radiance;
 			if (this.rectLight) {
 				this.rectLight.intensity = radiance * (1 - FIXTURE_FRACTION);
-				if (this.ready) this.pathTracer.updateLights();
+				if (syncTracer) this.pathTracer.updateLights();
 			}
-			if (this.ready) this.pathTracer.updateMaterials();
+			if (syncTracer) this.pathTracer.updateMaterials();
 		} else {
 			this.scene.environmentIntensity = intensity;
-			if (this.ready) this.pathTracer.updateEnvironment();
+			if (syncTracer) this.pathTracer.updateEnvironment();
 		}
+	}
+
+	/** Swap the room shell / environment, keeping all placed objects. */
+	setRoom(kind: RoomKind) {
+		if (!this.ready || kind === this.roomKind) return;
+		this.hideDenoise();
+		this.applyRoom(kind);
+		if (this.editing) {
+			// Raster shows it live; the traced BVH rebuilds on return to render.
+			this.objectsDirty = true;
+		} else {
+			this.pathTracer.setScene(this.scene, this.camera);
+			this.lastResetAt = performance.now();
+		}
+	}
+
+	getRoom(): RoomKind | null {
+		return this.roomKind;
+	}
+
+	/**
+	 * Build (or rebuild) the room's lighting. 'room' bakes a generated HDR
+	 * environment; the geometric rooms add a shell with an emissive patch or a
+	 * RectAreaLight. Pure scene-graph mutation — the caller syncs the tracer.
+	 */
+	private applyRoom(kind: RoomKind) {
+		// Tear down whatever the previous room installed.
+		if (this.roomShell) {
+			this.scene.remove(this.roomShell);
+			disposeObject(this.roomShell);
+			this.roomShell = null;
+		}
+		if (this.roomEnvTex) {
+			this.roomEnvTex.dispose();
+			this.roomEnvTex = null;
+		}
+		this.scene.environment = null;
+		this.scene.background = null;
+		this.patchMat = null;
+		this.rectLight = null;
+
+		if (kind === 'room') {
+			const tex = this.makeRoomEnvironment();
+			tex.mapping = EquirectangularReflectionMapping;
+			this.roomEnvTex = tex;
+			this.scene.environment = tex;
+			this.scene.background = tex;
+		} else {
+			this.roomShell = this.makeRoomShell(kind === 'room-arealight');
+			this.scene.add(this.roomShell);
+		}
+
+		this.roomKind = kind;
+		// Re-apply the current light intensity to the freshly built room.
+		this.setEnvironmentIntensity(this.envIntensity);
 	}
 
 	resize(width: number, height: number) {

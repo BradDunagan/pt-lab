@@ -2,7 +2,7 @@
 	import PathTracerViewer from './lib/PathTracerViewer.svelte';
 	import TransformPanel from './lib/TransformPanel.svelte';
 	import MaterialPanel from './lib/MaterialPanel.svelte';
-	import { PathTracerLab, type LabStatus, type LabObject } from './lib/pathtracer';
+	import { PathTracerLab, type LabStatus, type LabObject, type RoomKind } from './lib/pathtracer';
 
 	let lab = $state<PathTracerLab | null>(null);
 	let status = $state<LabStatus>({
@@ -27,6 +27,21 @@
 	let editMode = $state(false);
 	let objects = $state<LabObject[]>([]);
 	let selectedId = $state<string | null>(null);
+
+	const ROOM_OPTIONS: { value: RoomKind; label: string }[] = [
+		{ value: 'room', label: 'Baked HDR env' },
+		{ value: 'room-emissive', label: 'Emissive mesh' },
+		{ value: 'room-arealight', label: 'Rect area light' },
+	];
+	const ROOM_VALUES = ROOM_OPTIONS.map((r) => r.value) as string[];
+	let roomKind = $state<RoomKind>(
+		ROOM_VALUES.includes(currentScene) ? (currentScene as RoomKind) : 'room-arealight',
+	);
+
+	$effect(() => {
+		// No-ops until the lab is ready and only when the room actually changes.
+		lab?.setRoom(roomKind);
+	});
 
 	$effect(() => {
 		if (!lab) return;
@@ -157,6 +172,15 @@
 		{#if editMode}
 			<div class="editor">
 				<div class="scene-name">{currentSceneLabel}</div>
+
+				<label>
+					Room
+					<select value={roomKind} onchange={(e) => (roomKind = e.currentTarget.value as RoomKind)}>
+						{#each ROOM_OPTIONS as r (r.value)}
+							<option value={r.value}>{r.label}</option>
+						{/each}
+					</select>
+				</label>
 
 				<details class="group" open>
 					<summary>Objects</summary>
