@@ -3,6 +3,13 @@
 	import TransformPanel from './lib/TransformPanel.svelte';
 	import MaterialPanel from './lib/MaterialPanel.svelte';
 	import { PathTracerLab, type LabStatus, type LabObject, type RoomKind } from './lib/pathtracer';
+	import {
+		listSceneNames,
+		loadSceneData,
+		saveSceneData,
+		deleteSceneData,
+		newSceneData,
+	} from './lib/scenes';
 
 	let lab = $state<PathTracerLab | null>(null);
 	let status = $state<LabStatus>({
@@ -22,7 +29,58 @@
 		{ value: 'room-arealight', label: 'Room — rect area light' },
 	];
 	const currentScene = new URLSearchParams(location.search).get('scene') ?? 'helmet';
-	const currentSceneLabel = SCENES.find((s) => s.value === currentScene)?.label ?? currentScene;
+
+	// Dropdown value: a demo id, 'saved:<name>', or 'unsaved' (a New scene not
+	// yet saved). The scene name shown in both modes derives from it.
+	let sceneValue = $state<string>(currentScene);
+	let savedScenes = $state<string[]>(listSceneNames());
+	const currentSceneName = $derived.by(() => {
+		if (sceneValue === 'unsaved') return 'Untitled (unsaved)';
+		if (sceneValue.startsWith('saved:')) return sceneValue.slice(6);
+		return SCENES.find((s) => s.value === sceneValue)?.label ?? sceneValue;
+	});
+
+	function loadSavedScene(name: string) {
+		const data = loadSceneData(name);
+		if (!data || !lab) return;
+		lab.applyScene(data);
+		roomKind = data.room;
+		selectedId = null;
+		sceneValue = `saved:${name}`;
+	}
+
+	function onSceneChange(value: string) {
+		if (value.startsWith('saved:')) loadSavedScene(value.slice(6));
+		else changeScene(value); // a demo → page reload (as before)
+	}
+
+	function newScene() {
+		if (!lab) return;
+		const data = newSceneData();
+		lab.applyScene(data);
+		roomKind = data.room;
+		selectedId = null;
+		sceneValue = 'unsaved';
+	}
+
+	function saveScene() {
+		if (!lab) return;
+		const suggested = sceneValue.startsWith('saved:') ? sceneValue.slice(6) : '';
+		const name = prompt('Save scene as:', suggested)?.trim();
+		if (!name) return;
+		saveSceneData(name, lab.serializeScene());
+		savedScenes = listSceneNames();
+		sceneValue = `saved:${name}`;
+	}
+
+	function deleteScene() {
+		if (!sceneValue.startsWith('saved:')) return;
+		const name = sceneValue.slice(6);
+		if (!confirm(`Delete scene "${name}"?`)) return;
+		deleteSceneData(name);
+		savedScenes = listSceneNames();
+		newScene();
+	}
 
 	let editMode = $state(false);
 	let objects = $state<LabObject[]>([]);
@@ -171,7 +229,8 @@
 
 		{#if editMode}
 			<div class="editor">
-				<div class="scene-name">{currentSceneLabel}</div>
+				<button class="editor-btn wide" onclick={newScene}>New Scene</button>
+				<div class="scene-name">{currentSceneName}</div>
 
 				<label>
 					Room
@@ -228,18 +287,41 @@
 					</details>
 				{/if}
 
+				<div class="editor-actions">
+					<button class="editor-btn" onclick={saveScene}>Save…</button>
+					<button
+						class="editor-btn"
+						onclick={deleteScene}
+						disabled={!sceneValue.startsWith('saved:')}
+					>
+						Delete
+					</button>
+				</div>
+
 				<p class="hint">
 					Fast raster preview (no path tracing). Click a name to select, then edit
-					its material and transform.
+					its material and transform. New starts an empty room; Save names the scene.
 				</p>
 			</div>
 		{:else}
 		<label>
 			Scene
-			<select value={currentScene} onchange={(e) => changeScene(e.currentTarget.value)}>
-				{#each SCENES as s (s.value)}
-					<option value={s.value}>{s.label}</option>
-				{/each}
+			<select value={sceneValue} onchange={(e) => onSceneChange(e.currentTarget.value)}>
+				{#if sceneValue === 'unsaved'}
+					<option value="unsaved">{currentSceneName}</option>
+				{/if}
+				<optgroup label="Demos">
+					{#each SCENES as s (s.value)}
+						<option value={s.value}>{s.label}</option>
+					{/each}
+				</optgroup>
+				{#if savedScenes.length}
+					<optgroup label="Saved scenes">
+						{#each savedScenes as name (name)}
+							<option value={`saved:${name}`}>{name}</option>
+						{/each}
+					</optgroup>
+				{/if}
 			</select>
 		</label>
 
@@ -429,6 +511,34 @@
 		display: flex;
 		flex-direction: column;
 		gap: 1rem;
+	}
+
+	.editor-btn {
+		padding: 0.5rem;
+		border: 1px solid #3a3a45;
+		border-radius: 6px;
+		background: #22222b;
+		color: #eee;
+		cursor: pointer;
+		font-size: 0.85rem;
+	}
+
+	.editor-btn:hover:not(:disabled) {
+		background: #2c2c37;
+	}
+
+	.editor-btn:disabled {
+		opacity: 0.4;
+		cursor: default;
+	}
+
+	.editor-actions {
+		display: flex;
+		gap: 0.5rem;
+	}
+
+	.editor-actions .editor-btn {
+		flex: 1;
 	}
 
 	.scene-name {

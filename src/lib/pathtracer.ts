@@ -91,6 +91,22 @@ export interface LabMaterial {
 	reflectivity: number; // 0 (dielectric) .. 1 (metal)
 }
 
+/** One object's persisted state within a scene. */
+export interface SceneObjectState {
+	key: string; // stable library key (the object's name for built-ins)
+	included: boolean;
+	material: LabMaterial;
+	transform: LabTransform;
+}
+
+/** A saved editor scene: room + per-object state + camera. */
+export interface SceneData {
+	version: 1;
+	room: RoomKind;
+	objects: SceneObjectState[];
+	camera: { position: [number, number, number]; target: [number, number, number] } | null;
+}
+
 const RAD2DEG = 180 / Math.PI;
 const DEG2RAD = Math.PI / 180;
 
@@ -168,7 +184,10 @@ export class PathTracerLab {
 
 	// Editor object registry. Keyed by a stable per-session id (decoupled from
 	// the display name so imported duplicates never collide).
-	private objects = new Map<string, { object3d: Object3D; name: string; included: boolean }>();
+	private objects = new Map<
+		string,
+		{ object3d: Object3D; name: string; key: string; included: boolean }
+	>();
 	private objectCounter = 0;
 	private objectsChanged?: (objects: LabObject[]) => void;
 	// Set when the included-set or a transform changed while editing, so
@@ -177,6 +196,9 @@ export class PathTracerLab {
 	private objectsDirty = false;
 	// Set when only materials changed — a cheaper updateMaterials() on return.
 	private materialsDirty = false;
+	// True while buildEditorScene rebuilds; suppresses tracer syncs against the
+	// half-built scene (setScene refreshes everything once the build finishes).
+	private buildingScene = false;
 
 	private denoiseCanvas?: HTMLCanvasElement;
 	private captureCanvas = document.createElement('canvas');
@@ -818,9 +840,9 @@ export class PathTracerLab {
 		}
 	}
 
-	private registerObject(object3d: Object3D, name: string) {
+	private registerObject(object3d: Object3D, name: string, key: string = name) {
 		const id = `obj-${++this.objectCounter}`;
-		this.objects.set(id, { object3d, name, included: object3d.visible });
+		this.objects.set(id, { object3d, name, key, included: object3d.visible });
 	}
 
 	listObjects(): LabObject[] {
@@ -929,9 +951,9 @@ export class PathTracerLab {
 
 	setEnvironmentIntensity(intensity: number) {
 		this.envIntensity = intensity;
-		// In edit mode we only update the light objects (the raster view reads
-		// them directly); the tracer resyncs on return to render.
-		const syncTracer = this.ready && !this.editing;
+		// In edit mode (or mid-rebuild) we only update the light objects (the
+		// raster view reads them directly); the tracer resyncs afterward.
+		const syncTracer = this.ready && !this.editing && !this.buildingScene;
 		if (this.patchMat) {
 			// The geometric rooms have no environment; the slider scales the lamp
 			// (both halves of the split, in the arealight room).
@@ -1003,6 +1025,95 @@ export class PathTracerLab {
 		this.roomKind = kind;
 		// Re-apply the current light intensity to the freshly built room.
 		this.setEnvironmentIntensity(this.envIntensity);
+	}
+
+	/** Capture the current editor scene as saveable data. */
+	serializeScene(): SceneData {
+		const objects: SceneObjectState[] = [];
+		for (const [id, entry] of this.objects) {
+			const material = this.getObjectMaterial(id);
+			const transform = this.getObjectTransform(id);
+			if (!material || !transform) continue;
+			objects.push({ key: entry.key, included: entry.included, material, transform });
+		}
+		return {
+			version: 1,
+			room: this.roomKind ?? 'room-arealight',
+			objects,
+			camera: {
+				position: [this.camera.position.x, this.camera.position.y, this.camera.position.z],
+				target: [this.controls.target.x, this.controls.target.y, this.controls.target.z],
+			},
+		};
+	}
+
+	/** Replace the whole scene with a saved (or new) editor scene. */
+	applyScene(data: SceneData) {
+		if (!this.ready) return;
+		this.hideDenoise();
+		this.buildEditorScene(data);
+		this.emitObjects();
+		if (this.editing) {
+			this.objectsDirty = true;
+		} else {
+			this.pathTracer.setScene(this.scene, this.camera);
+			this.lastResetAt = performance.now();
+		}
+	}
+
+	/**
+	 * Rebuild the scene from scratch: floor + object library + room + saved
+	 * per-object state + camera. Starting from a clean slate means applyScene
+	 * works identically no matter what was loaded before (a demo or another
+	 * saved scene).
+	 */
+	private buildEditorScene(data: SceneData) {
+		this.buildingScene = true;
+		for (const child of [...this.scene.children]) {
+			this.scene.remove(child);
+			disposeObject(child);
+		}
+		this.objects.clear();
+		this.objectCounter = 0;
+		this.roomShell = null;
+		this.patchMat = null;
+		this.rectLight = null;
+		if (this.roomEnvTex) {
+			this.roomEnvTex.dispose();
+			this.roomEnvTex = null;
+		}
+		this.roomKind = null;
+		this.scene.environment = null;
+		this.scene.background = null;
+
+		const floor = new Mesh(
+			new PlaneGeometry(ROOM_HALF * 2, ROOM_HALF * 2).rotateX(-Math.PI / 2),
+			new MeshPhysicalMaterial({ color: 0x8c8c8c, roughness: 0.85 }),
+		);
+		this.scene.add(floor);
+
+		// The object library (registers Table, Cube, Ball).
+		this.scene.add(this.makeTableScene());
+		this.applyRoom(data.room);
+
+		for (const [id, entry] of this.objects) {
+			const saved = data.objects.find((o) => o.key === entry.key);
+			const included = saved?.included ?? false;
+			entry.included = included;
+			entry.object3d.visible = included;
+			if (saved) {
+				this.setObjectMaterial(id, saved.material);
+				this.setObjectTransform(id, saved.transform);
+			}
+		}
+
+		if (data.camera) {
+			this.camera.position.set(...data.camera.position);
+			this.controls.target.set(...data.camera.target);
+		}
+		this.camera.updateProjectionMatrix();
+		this.controls.update();
+		this.buildingScene = false;
 	}
 
 	resize(width: number, height: number) {
