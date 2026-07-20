@@ -40,6 +40,35 @@
 		selectedId && lab ? lab.getObjectTransform(selectedId) : null,
 	);
 
+	// Resizable sidebar. Width is driven inline; the viewer's ResizeObserver
+	// keeps the canvas in sync as the sidebar grows/shrinks.
+	const SIDEBAR_MIN = 200;
+	const SIDEBAR_MAX = 720;
+	let sidebarWidth = $state(250);
+
+	function startResize(e: PointerEvent) {
+		e.preventDefault();
+		const handle = e.currentTarget as HTMLElement;
+		handle.setPointerCapture(e.pointerId);
+		document.body.style.userSelect = 'none';
+		document.body.style.cursor = 'ew-resize';
+		const onMove = (ev: PointerEvent) => {
+			// Sidebar is anchored to the right edge, so width grows as the
+			// pointer moves left.
+			const w = window.innerWidth - ev.clientX;
+			sidebarWidth = Math.max(SIDEBAR_MIN, Math.min(SIDEBAR_MAX, w));
+		};
+		const onUp = () => {
+			handle.releasePointerCapture(e.pointerId);
+			handle.removeEventListener('pointermove', onMove);
+			handle.removeEventListener('pointerup', onUp);
+			document.body.style.userSelect = '';
+			document.body.style.cursor = '';
+		};
+		handle.addEventListener('pointermove', onMove);
+		handle.addEventListener('pointerup', onUp);
+	}
+
 	// Scene selection lives in the URL (?scene=...) so views are shareable;
 	// switching reloads the page, which rebuilds the whole scene and BVH anyway.
 	function changeScene(value: string) {
@@ -106,7 +135,14 @@
 <main>
 	<PathTracerViewer bind:lab bind:status />
 
-	<aside>
+	<div
+		class="resize-handle"
+		role="separator"
+		aria-orientation="vertical"
+		onpointerdown={startResize}
+	></div>
+
+	<aside style="width: {sidebarWidth}px">
 		<h1>pt-lab</h1>
 		<p class="subtitle">three.js + three-gpu-pathtracer</p>
 
@@ -235,7 +271,6 @@
 	}
 
 	aside {
-		width: 250px;
 		flex-shrink: 0;
 		padding: 1.25rem;
 		display: flex;
@@ -244,6 +279,17 @@
 		background: #16161c;
 		border-left: 1px solid #2a2a33;
 		overflow-y: auto;
+	}
+
+	.resize-handle {
+		flex: 0 0 5px;
+		cursor: ew-resize;
+		background: #101016;
+		transition: background 0.15s;
+	}
+
+	.resize-handle:hover {
+		background: #7c6cf4;
 	}
 
 	h1 {
