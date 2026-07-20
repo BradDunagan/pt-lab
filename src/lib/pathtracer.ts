@@ -37,7 +37,7 @@ import { RectAreaLightUniformsLib } from 'three/addons/lights/RectAreaLightUnifo
 import { WebGLPathTracer } from 'three-gpu-pathtracer';
 import type { UNet } from 'oidn-web';
 
-export type RenderMode = 'loading' | 'building-bvh' | 'raster' | 'pathtracing';
+export type RenderMode = 'loading' | 'building-bvh' | 'raster' | 'pathtracing' | 'editing';
 
 export type DenoiseState =
 	| 'off'
@@ -115,6 +115,7 @@ export class PathTracerLab {
 	private lastSamples = 0;
 	private ready = false;
 	private disposed = false;
+	private editing = false;
 	private patchMat: MeshPhysicalMaterial | null = null;
 	private rectLight: RectAreaLight | null = null;
 
@@ -434,6 +435,17 @@ export class PathTracerLab {
 		if (this.disposed) return;
 		this.rafId = requestAnimationFrame(this.loop);
 
+		if (this.editing) {
+			// Scene Editor: a plain, fast raster pass — no path tracing. This is
+			// the same rasterization the tracer already shows while interacting,
+			// so switching backends is a no-op for the renderer.
+			this.controls.update();
+			this.renderer.setRenderTarget(null);
+			this.renderer.render(this.scene, this.camera);
+			this.emit('editing');
+			return;
+		}
+
 		this.pathTracer.pausePathTracing =
 			this.maxSamples > 0 && this.pathTracer.samples >= this.maxSamples;
 		this.pathTracer.renderSample();
@@ -718,6 +730,21 @@ export class PathTracerLab {
 		this.pathTracer.enablePathTracing = enabled;
 		if (!enabled) this.hideDenoise();
 		if (enabled && this.ready) this.pathTracer.reset();
+	}
+
+	/** Toggle between path-traced render mode and the fast raster edit mode. */
+	setEditMode(edit: boolean) {
+		if (this.editing === edit) return;
+		this.editing = edit;
+		if (edit) {
+			this.hideDenoise();
+		} else if (this.ready) {
+			// Returning to render mode: the scene may have changed while editing,
+			// so restart accumulation from a clean sample 0.
+			this.pathTracer.updateCamera();
+			this.pathTracer.reset();
+			this.lastResetAt = performance.now();
+		}
 	}
 
 	setBounces(bounces: number) {

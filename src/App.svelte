@@ -20,6 +20,9 @@
 		{ value: 'room-arealight', label: 'Room — rect area light' },
 	];
 	const currentScene = new URLSearchParams(location.search).get('scene') ?? 'helmet';
+	const currentSceneLabel = SCENES.find((s) => s.value === currentScene)?.label ?? currentScene;
+
+	let editMode = $state(false);
 
 	// Scene selection lives in the URL (?scene=...) so views are shareable;
 	// switching reloads the page, which rebuilds the whole scene and BVH anyway.
@@ -43,6 +46,9 @@
 	let maxSamplesIndex = $state(0);
 	const maxSamples = $derived(MAX_SAMPLES_STOPS[maxSamplesIndex]);
 
+	$effect(() => {
+		lab?.setEditMode(editMode);
+	});
 	$effect(() => {
 		lab?.setPathTracingEnabled(pathTracingEnabled);
 	});
@@ -88,6 +94,19 @@
 		<h1>pt-lab</h1>
 		<p class="subtitle">three.js + three-gpu-pathtracer</p>
 
+		<button class="mode-toggle" onclick={() => (editMode = !editMode)}>
+			{editMode ? '← Return to Render' : 'Edit Scene →'}
+		</button>
+
+		{#if editMode}
+			<div class="editor">
+				<div class="scene-name">{currentSceneLabel}</div>
+				<p class="hint">
+					Scene Editor — fast raster preview (no path tracing). Orbit to inspect.
+					Object, material, and transform tools arrive in the next steps.
+				</p>
+			</div>
+		{:else}
 		<label>
 			Scene
 			<select value={currentScene} onchange={(e) => changeScene(e.currentTarget.value)}>
@@ -153,6 +172,7 @@
 			Orbit to move the camera — accumulation restarts from sample 0 and the
 			image progressively converges once the camera is still.
 		</p>
+		{/if}
 	</aside>
 </main>
 
@@ -255,6 +275,32 @@
 
 	button:hover:not(:disabled) {
 		background: #2c2c37;
+	}
+
+	.mode-toggle {
+		background: #2a2440;
+		border-color: #4a3f7a;
+		font-weight: 600;
+		color: #d9d2ff;
+	}
+
+	.mode-toggle:hover:not(:disabled) {
+		background: #332b52;
+	}
+
+	.editor {
+		display: flex;
+		flex-direction: column;
+		gap: 1rem;
+	}
+
+	.scene-name {
+		padding: 0.5rem 0.75rem;
+		border-radius: 6px;
+		background: #101016;
+		color: #f0f0f4;
+		font-weight: 600;
+		font-size: 0.9rem;
 	}
 
 	button:disabled {
