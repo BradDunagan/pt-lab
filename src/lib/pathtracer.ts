@@ -14,6 +14,7 @@ import {
 	MeshBasicMaterial,
 	MeshNormalMaterial,
 	MeshPhysicalMaterial,
+	MeshStandardMaterial,
 	NoToneMapping,
 	PerspectiveCamera,
 	PlaneGeometry,
@@ -80,6 +81,16 @@ export interface LabTransform {
 	scale: [number, number, number];
 }
 
+/**
+ * An object's appearance in editor-friendly terms. These map onto PBR
+ * material properties: shininess = 1 - roughness, reflectivity = metalness.
+ */
+export interface LabMaterial {
+	color: string; // '#rrggbb' (sRGB)
+	shininess: number; // 0 (matte) .. 1 (mirror-sharp)
+	reflectivity: number; // 0 (dielectric) .. 1 (metal)
+}
+
 const RAD2DEG = 180 / Math.PI;
 const DEG2RAD = Math.PI / 180;
 
@@ -142,9 +153,12 @@ export class PathTracerLab {
 	private objects = new Map<string, { object3d: Object3D; name: string; included: boolean }>();
 	private objectCounter = 0;
 	private objectsChanged?: (objects: LabObject[]) => void;
-	// Set when the included-set changed while editing, so returning to render
-	// mode rebuilds the BVH (which drops now-hidden meshes via traverseVisible).
+	// Set when the included-set or a transform changed while editing, so
+	// returning to render rebuilds the BVH (drops hidden meshes via
+	// traverseVisible; refits for moved geometry).
 	private objectsDirty = false;
+	// Set when only materials changed — a cheaper updateMaterials() on return.
+	private materialsDirty = false;
 
 	private denoiseCanvas?: HTMLCanvasElement;
 	private captureCanvas = document.createElement('canvas');
@@ -774,11 +788,17 @@ export class PathTracerLab {
 			this.hideDenoise();
 		} else if (this.ready) {
 			if (this.objectsDirty) {
-				// The set of visible objects changed; rebuild the BVH (setScene
-				// skips hidden meshes and resets accumulation itself).
+				// Visibility or geometry changed; rebuild the BVH (setScene skips
+				// hidden meshes, refits moved geometry, and resets itself). This
+				// also re-reads materials, so any material edits are covered too.
 				this.objectsDirty = false;
+				this.materialsDirty = false;
 				this.pathTracer.setScene(this.scene, this.camera);
 			} else {
+				if (this.materialsDirty) {
+					this.materialsDirty = false;
+					this.pathTracer.updateMaterials();
+				}
 				this.pathTracer.updateCamera();
 				this.pathTracer.reset();
 			}
@@ -836,6 +856,48 @@ export class PathTracerLab {
 		o.scale.set(t.scale[0], t.scale[1], t.scale[2]);
 		// Live in the raster view; the traced BVH refits on return to render.
 		this.objectsDirty = true;
+	}
+
+	/** Every standard/physical material under an object (deduped). */
+	private materialsOf(obj: Object3D): MeshStandardMaterial[] {
+		const found = new Set<MeshStandardMaterial>();
+		obj.traverse((child) => {
+			const mesh = child as Mesh;
+			if (!mesh.isMesh || !mesh.material) return;
+			const list = Array.isArray(mesh.material) ? mesh.material : [mesh.material];
+			for (const m of list) {
+				if ((m as MeshStandardMaterial).isMeshStandardMaterial) {
+					found.add(m as MeshStandardMaterial);
+				}
+			}
+		});
+		return [...found];
+	}
+
+	getObjectMaterial(id: string): LabMaterial | null {
+		const entry = this.objects.get(id);
+		if (!entry) return null;
+		const mats = this.materialsOf(entry.object3d);
+		if (!mats.length) return null;
+		const m = mats[0];
+		return {
+			color: `#${m.color.getHexString()}`,
+			shininess: 1 - m.roughness,
+			reflectivity: m.metalness,
+		};
+	}
+
+	setObjectMaterial(id: string, mat: LabMaterial) {
+		const entry = this.objects.get(id);
+		if (!entry) return;
+		for (const m of this.materialsOf(entry.object3d)) {
+			m.color.set(mat.color);
+			m.roughness = 1 - mat.shininess;
+			m.metalness = mat.reflectivity;
+			// Scalar/color uniforms update without a shader recompile, so no
+			// needsUpdate. Live in raster; the tracer re-reads on return.
+		}
+		this.materialsDirty = true;
 	}
 
 	setBounces(bounces: number) {

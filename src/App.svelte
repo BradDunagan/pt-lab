@@ -1,6 +1,7 @@
 <script lang="ts">
 	import PathTracerViewer from './lib/PathTracerViewer.svelte';
 	import TransformPanel from './lib/TransformPanel.svelte';
+	import MaterialPanel from './lib/MaterialPanel.svelte';
 	import { PathTracerLab, type LabStatus, type LabObject } from './lib/pathtracer';
 
 	let lab = $state<PathTracerLab | null>(null);
@@ -38,6 +39,9 @@
 	// TransformPanel should re-seed. Edits after that flow one-way to the lab.
 	const selectedTransform = $derived(
 		selectedId && lab ? lab.getObjectTransform(selectedId) : null,
+	);
+	const selectedMaterial = $derived(
+		selectedId && lab ? lab.getObjectMaterial(selectedId) : null,
 	);
 
 	// Resizable sidebar. Width is driven inline; the viewer's ResizeObserver
@@ -176,6 +180,18 @@
 					{/if}
 				</details>
 
+				{#if selectedId && selectedMaterial}
+					<details class="group" open>
+						<summary>Material — {selectedName}</summary>
+						{#key selectedId}
+							<MaterialPanel
+								material={selectedMaterial}
+								onchange={(m) => selectedId && lab?.setObjectMaterial(selectedId, m)}
+							/>
+						{/key}
+					</details>
+				{/if}
+
 				{#if selectedId && selectedTransform}
 					<details class="group" open>
 						<summary>Transform — {selectedName}</summary>
@@ -189,8 +205,8 @@
 				{/if}
 
 				<p class="hint">
-					Fast raster preview (no path tracing). Click a name to select and edit
-					its transform. Material tools come next.
+					Fast raster preview (no path tracing). Click a name to select, then edit
+					its material and transform.
 				</p>
 			</div>
 		{:else}
