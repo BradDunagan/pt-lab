@@ -23,9 +23,18 @@ Three layers, with a deliberate framework boundary:
 
 - `src/lib/pathtracer.ts` — **the reusable core**, and the piece intended to port into the larger app. `PathTracerLab` is a framework-agnostic class owning the `WebGLRenderer`, scene, `OrbitControls`, and `WebGLPathTracer`. The host UI talks to it only through public methods and the `onStatus` callback — never through three.js internals. Preserve this boundary: don't leak three.js types or objects into the Svelte layer (the boundary exists so the backend can be swapped for WebGPU later).
 - `src/lib/PathTracerViewer.svelte` — thin glue: mounts the class on a canvas, wires `ResizeObserver`, disposes on unmount, exposes `lab` and `status` via `$bindable` props.
-- `src/App.svelte` — control panel. Svelte 5 runes (`$state`/`$effect`/`$derived`); each control pushes into the lab via an `$effect`.
+- `src/App.svelte` — control panel + Scene Editor UI. Svelte 5 runes (`$state`/`$effect`/`$derived`); each control pushes into the lab via an `$effect`. Inspector panels (`TransformPanel.svelte`, `MaterialPanel.svelte`) hold a local copy seeded once from the selection and are keyed by object id (`{#key selectedId}`) so switching selection remounts and re-seeds them.
 
-Assets (Damaged Helmet glTF, HDR environment) are served statically from `public/assets/` and loaded via `import.meta.env.BASE_URL`. If the model fails to load, `PathTracerLab` falls back to a procedural scene.
+Assets (Damaged Helmet glTF, HDR environment, denoiser `.tza` weights) are served statically from `public/assets/` and loaded via `import.meta.env.BASE_URL`. If the model fails to load, `PathTracerLab` falls back to a procedural scene.
+
+### Scene Editor
+
+`PathTracerLab` also hosts a data-driven Scene Editor (`docs/what-this-is.md` has the user-facing details). Load-bearing points:
+
+- **Two render modes**: path-traced (`renderSample()`) vs. a fast raster edit mode (`renderer.render()` when `editing`). Object/room/material edits happen in edit mode against the raster view and mark the scene dirty; returning to render rebuilds/updates the tracer.
+- **A scene is data** (`SceneData`: room + per-object state + camera). `buildEditorScene()` rebuilds the whole scene from scratch (floor + object library + room + state), which is why loading a saved scene works from any starting point. The room demos now route through this same path.
+- **Two-tier persistence**: the object library (built-in factories + imported `.glb` templates) is global (`library-store.ts`); named scenes reference objects by key (`scenes.ts`). Both are localStorage. Material props are exposed as artist terms (shininess = `1 − roughness`, reflectivity = `metalness`).
+- Keep the framework boundary: the editor API is plain-data methods/callbacks (`listObjects`, `setObjectMaterial`, `serializeScene`, `applyScene`, `importGLB`, `onObjectsChanged`) — no three.js types cross into Svelte.
 
 ## Path-tracer behavior that shapes the code
 

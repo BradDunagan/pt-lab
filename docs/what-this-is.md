@@ -18,10 +18,13 @@ This maps well onto "photo-realistic stills": let the tracer run for seconds-to-
 
 | Path | Role |
 |---|---|
-| `src/lib/pathtracer.ts` | **The reusable core.** Framework-agnostic class wrapping renderer, scene, controls, and `WebGLPathTracer`. Talks to the host UI only through public methods and an `onStatus` callback. |
+| `src/lib/pathtracer.ts` | **The reusable core.** Framework-agnostic class wrapping renderer, scene, controls, and `WebGLPathTracer`. Talks to the host UI only through public methods and callbacks (`onStatus`, `onObjectsChanged`). Also owns the Scene Editor model: object registry, room swapping, serialize/apply, and `.glb` import. |
 | `src/lib/PathTracerViewer.svelte` | Thin Svelte binding: mounts the class on a canvas, wires `ResizeObserver`, disposes on unmount. |
-| `src/App.svelte` | Control panel + status readout (Svelte 5 runes). |
-| `public/assets/` | Demo model + HDR, served statically. |
+| `src/lib/TransformPanel.svelte`, `MaterialPanel.svelte` | Per-object inspector panels (keyed by object id so they re-seed on selection change). |
+| `src/lib/scenes.ts` | localStorage store for named editor scenes (room + per-object state + camera). |
+| `src/lib/library-store.ts` | localStorage store for imported `.glb` objects (bytes as base64). |
+| `src/App.svelte` | Control panel + status readout + Scene Editor UI (Svelte 5 runes). |
+| `public/assets/` | Demo model + HDR + denoiser weights, served statically. |
 
 ## Scenes
 
@@ -36,6 +39,39 @@ A Scene selector in the sidebar (backed by the `?scene=` query param; switching 
 | `room-arealight` | same | Room as real geometry; the light is a **`RectAreaLight`**, which the path tracer importance-samples → spatially correct *and* fast. Lights are invisible to rays in this pathtracer version, so the lamp's output is split 90/10 between the sampled light and a co-located emissive quad that makes the fixture visible |
 
 The room trio is a deliberate ladder — baked environment vs. emissive geometry vs. sampled light — demonstrating why production scenes model nearby lights as sampled light objects and reserve the environment map for distant surroundings. In the room scenes the Environment slider scales the lamp instead of an env map. `window.__lab` exposes the `PathTracerLab` instance for console/automation driving.
+
+## Scene Editor
+
+The **Edit Scene / Return to Render** button toggles between two modes:
+
+- **Render** — the path-traced Live Scene described above (plus AI denoising).
+- **Edit** — a fast **raster** preview (`renderer.render(scene, camera)` each frame, no accumulation) for composing a scene. Edits show instantly; the traced BVH only rebuilds when you return to Render. Raster fidelity varies by room — reflections need a `scene.environment` or direct light, so the emissive room looks dark in Edit and is best judged in Render.
+
+A scene is **data**, not code: a chosen room + which objects are included + each object's material and transform + the camera. The editor sidebar (in Edit mode) is: a **Room** dropdown, an **Objects** list (checkbox = in the scene, name = select for editing), and inspector groups for the selected object.
+
+### Editing objects — material properties
+
+The material controls use artist-friendly names mapped onto the underlying `MeshPhysicalMaterial` (PBR):
+
+| Control | Maps to | Meaning |
+|---|---|---|
+| **Color** | `material.color` | Base color / albedo — the light the surface doesn't absorb. |
+| **Shininess** | `1 − roughness` | Reflection sharpness: high = mirror-crisp highlights, low = matte/blurred. |
+| **Reflectivity** | `metalness` | Dielectric ↔ conductor: low = plastic (weak reflections + diffuse color), high = metal (mirror-like, reflections tinted by the color, no diffuse). |
+
+The two sliders together span a wide range — shiny+reflective = chrome, shiny+non-reflective = polished plastic, matte+reflective = brushed metal, matte+non-reflective = chalk. **Transform** (Position m / Rotation ° / Scale) edits the object's placement.
+
+Why edits behave differently: material changes are cheap (`updateMaterials()` keeps the BVH); moving/scaling geometry needs a BVH refit, so it applies live in raster and rebuilds via `setScene()` on return to Render.
+
+### Persistence
+
+Scenes are named and saved to localStorage (**New** / **Save…** / **Delete**). A new scene is a room with its light and no objects. The render-mode Scene dropdown lists the built-in demos (which reload) plus saved scenes (which apply live, rebuilt from scratch by `applyScene` so loading works identically from any starting point). Two storage tiers: the **object library** (Table/Cube/Ball + imports) persists globally; each **scene** stores only per-object inclusion/material/transform keyed by object name.
+
+### Importing Blender models
+
+**Import .glb…** (in the Objects group) adds a model to the object library; it persists (bytes stored base64 in localStorage) and appears in every editor scene without re-importing. The **×** beside an imported object removes it. Imports are parsed once into a template and cloned per scene with independent materials, so editing one scene's copy doesn't affect others.
+
+Recommended Blender export: **File → Export → glTF 2.0**, format **glTF Binary (.glb)**. Use the **Principled BSDF** (its base color, roughness, metallic, transmission, IOR, and emission map to the material via KHR extensions). **Turn off Draco / mesh compression** — no decompressor is wired in. Apply object transforms (**Ctrl+A → All Transforms**) so the position/rotation/scale sliders behave predictably; the exporter's default **+Y up** is correct. Keep objects simple: the bytes live in localStorage (~5 MB budget shared with scenes), so large or textured models can hit the quota (you'll see a "Storage full" message).
 
 ## Integration notes for the larger web app
 
