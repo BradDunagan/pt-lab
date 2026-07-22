@@ -1313,18 +1313,58 @@ export class PathTracerLab {
 		this.pathTracer.reset();
 
 		try {
+			// If denoising is on, make sure the right UNet is loaded before we
+			// converge (so the export waits for it rather than skipping).
+			if (this.denoiseEnabled) await this.prepareUNet();
+			const unet = this.denoiseEnabled ? this.activeUNet() : null;
+			const convergeSpan = unet ? 0.85 : 1; // leave headroom for the denoise phase
+
 			while (this.pathTracer.samples < EXPORT_SAMPLES && !this.disposed) {
 				this.pathTracer.renderSample();
-				onProgress?.(this.pathTracer.samples / EXPORT_SAMPLES);
+				onProgress?.(convergeSpan * (this.pathTracer.samples / EXPORT_SAMPLES));
 				await new Promise(requestAnimationFrame);
 			}
 			if (this.disposed) return;
-			onProgress?.(1);
-			// Redraw and capture in the SAME tick: the WebGL drawing buffer isn't
-			// preserved across composites, so an intervening frame would blank it.
+
+			// Redraw and snapshot the color in the SAME tick: the WebGL drawing
+			// buffer isn't preserved across composites, so a later frame blanks it.
 			this.pathTracer.renderSample();
+			this.captureCanvas.width = size;
+			this.captureCanvas.height = size;
+			const ctx = this.captureCanvas.getContext('2d', { willReadFrequently: true })!;
+			ctx.drawImage(this.renderer.domElement, 0, 0);
+			let image = ctx.getImageData(0, 0, size, size);
+
+			// Denoise the export using the same UNet / aux choice as the live view.
+			if (unet) {
+				let aux: { albedo: ImageData; normal: ImageData } | null = null;
+				if (unet === this.unetAux) {
+					try {
+						aux = this.captureAuxBuffers(size, size);
+					} catch (err) {
+						console.warn('Aux capture failed during export; denoising color-only:', err);
+					}
+				}
+				if (unet !== this.unetAux || aux) {
+					image = await new Promise<ImageData>((resolve) => {
+						unet.tileExecute({
+							color: image,
+							...(aux ? { albedo: aux.albedo, normal: aux.normal } : {}),
+							progress: (_out, _tile, _rect, i, n) =>
+								onProgress?.(0.85 + 0.15 * ((i + 1) / Math.max(1, n))),
+							done: (out) => resolve(out),
+						});
+					});
+				}
+			}
+			onProgress?.(1);
+
+			const out = document.createElement('canvas');
+			out.width = size;
+			out.height = size;
+			out.getContext('2d')!.putImageData(image, 0, 0);
 			await new Promise<void>((resolve) => {
-				this.renderer.domElement.toBlob((blob) => {
+				out.toBlob((blob) => {
 					if (blob) {
 						const url = URL.createObjectURL(blob);
 						const a = document.createElement('a');
