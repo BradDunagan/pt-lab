@@ -2,7 +2,7 @@
 
 A small lab for evaluating **photo-realistic, not-necessarily-realtime rendering in the browser** using [three.js](https://threejs.org) and [three-gpu-pathtracer](https://github.com/gkjohnson/three-gpu-pathtracer). The goal is to understand quality, convergence speed, and the integration surface before building this capability into a larger web app.
 
-The demo loads a glTF model (Khronos Damaged Helmet) under an HDR environment (Poly Haven "Royal Esplanade") and renders it with a progressive GPU path tracer. A Svelte 5 control panel exposes bounces, render scale, sample cap, and environment intensity, plus a PNG export of the converged frame.
+The demo loads a glTF model (Khronos Damaged Helmet) under an HDR environment (Poly Haven "Royal Esplanade") and renders it with a progressive GPU path tracer. A Svelte 5 control panel exposes bounces, render scale, sample cap, and environment intensity, plus a fixed-size PNG export of the converged frame.
 
 ## How it works
 
@@ -110,7 +110,11 @@ Progressive accumulation means clean output takes hundreds of samples. Practical
 - **Sample cap + UI feedback**: expose `pathTracer.samples` (the lab shows samples + elapsed time). Users tolerate waiting when they can see progress.
 - **`filterGlossyFactor`** (~0.5): blurs caustic-ish glossy paths slightly to kill fireflies at a small quality cost.
 - **`renderScale`**: converge at 0.5× for previews, 1× for finals.
-- **AI denoising**: the "AI denoise" checkbox runs [oidn-web](https://github.com/pissang/oidn-web) (Intel Open Image Denoise via tfjs/WebGPU — WebGPU-only). Implementation: the tone-mapped canvas is captured and denoised on a doubling schedule (4, 8, 16, … samples, plus a final pass at the sample cap), with the result drawn to a 2D overlay canvas that fades in over the live render; any accumulation reset hides it. `oidn-web` is dynamically imported on first enable (it pulls in tfjs); weights live in `public/assets/` (`rt_ldr.tza`, `rt_ldr_alb_nrm.tza` — Git LFS files in their source repos, fetch via the LFS media endpoint or batch API, not `raw.githubusercontent.com`). Save PNG exports the denoised overlay when it's showing.
+- **AI denoising**: the "AI denoise" checkbox runs [oidn-web](https://github.com/pissang/oidn-web) (Intel Open Image Denoise via tfjs/WebGPU — WebGPU-only). Implementation: the tone-mapped canvas is captured and denoised on a doubling schedule (4, 8, 16, … samples, plus a final pass at the sample cap), with the result drawn to a 2D overlay canvas that fades in over the live render; any accumulation reset hides it. `oidn-web` is dynamically imported on first enable (it pulls in tfjs); weights live in `public/assets/` (`rt_ldr.tza`, `rt_ldr_alb_nrm.tza` — Git LFS files in their source repos, fetch via the LFS media endpoint or batch API, not `raw.githubusercontent.com`). Denoising operates on the interactive overlay only — the fixed-size PNG export (below) re-renders and is not denoised.
+
+### Fixed-size PNG export
+
+**Save PNG** exports at a chosen square resolution (64²–1024², from the Export size dropdown), independent of the viewport/display. `exportPNG()` temporarily resizes the renderer to `size × size` at pixel-ratio 1 with a square camera, converges to a fixed sample count (the render loop yields to it so the button can show progress), captures, and restores the interactive view. It's a genuine native-resolution render, not a resample. Two gotchas it handles: the WebGL drawing buffer isn't preserved across composites, so the final sample is drawn and captured in the **same synchronous tick** (an intervening animation frame blanks it); and all renderer/camera state is saved and restored around the export.
 - **Auxiliary buffers** ("Albedo/normal aux" checkbox, on by default): alongside the noisy color, the denoiser receives two noise-free guide images rendered from the scene — a per-mesh unlit base-color pass (albedo; materials temporarily swapped for `MeshBasicMaterial` mirrors, background white per OIDN convention) and a packed view-space normal pass (`scene.overrideMaterial = MeshNormalMaterial`, background 0x808080 = zero normal). These act as an edge map, so low-sample denoised images keep silhouettes and material boundaries crisp instead of smearing them. Captured once per accumulation cycle into `WebGLRenderTarget`s (albedo target uses an sRGB texture so readback matches the color capture; rows are flipped since GL reads bottom-up), cached until the next reset. Aux and color-only UNets are incompatible, so both are kept and lazily loaded; if aux weights or capture fail, it falls back to color-only with a console warning. Known simplifications: normal maps are lost under the override material, and emissive-only surfaces (the room lamp) get black albedo. Denoising tone-mapped LDR remains off-spec (OIDN prefers linear HDR) but works well in practice.
 
 ### Other production caveats
@@ -129,4 +133,4 @@ npm run dev      # dev server
 npm run build    # type-check happens via `npm run check`; build emits dist/
 ```
 
-Orbit with the mouse; release and the image starts converging. "Save PNG" downloads the current frame.
+Orbit with the mouse; release and the image starts converging. **Save PNG** re-renders the scene at a chosen square resolution (64²–1024²) and downloads it.

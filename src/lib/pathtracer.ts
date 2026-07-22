@@ -23,6 +23,7 @@ import {
 	SphereGeometry,
 	SRGBColorSpace,
 	TorusKnotGeometry,
+	Vector2,
 	Vector3,
 	WebGLRenderer,
 	WebGLRenderTarget,
@@ -137,6 +138,10 @@ const DEG2RAD = Math.PI / 180;
 const MODEL_URL = `${import.meta.env.BASE_URL}assets/damaged-helmet.glb`;
 const ENV_URL = `${import.meta.env.BASE_URL}assets/royal_esplanade_1k.hdr`;
 
+// Samples a fixed-size PNG export converges to before it's written. Small
+// export sizes reach this quickly; 1024² takes a few seconds (progress shown).
+const EXPORT_SAMPLES = 300;
+
 /** ?scene=procedural | room | room-emissive | room-arealight forces an alternate scene instead of the helmet. */
 function sceneParam(): string | null {
 	return new URLSearchParams(location.search).get('scene');
@@ -212,6 +217,7 @@ export class PathTracerLab {
 	private ready = false;
 	private disposed = false;
 	private editing = false;
+	private exporting = false;
 	private patchMat: MeshPhysicalMaterial | null = null;
 	private rectLight: RectAreaLight | null = null;
 	// Current room and its swappable pieces (shell geometry or baked env map).
@@ -595,6 +601,9 @@ export class PathTracerLab {
 	private loop = () => {
 		if (this.disposed) return;
 		this.rafId = requestAnimationFrame(this.loop);
+
+		// During a fixed-size export, exportPNG() drives rendering itself.
+		if (this.exporting) return;
 
 		if (this.editing) {
 			// Scene Editor: a plain, fast raster pass — no path tracing. This is
@@ -1275,26 +1284,71 @@ export class PathTracerLab {
 		if (this.ready) this.pathTracer.updateCamera();
 	}
 
-	savePNG(filename = 'pt-lab.png') {
-		if (!this.ready) return;
-		// Save what's on screen: the denoised overlay when it's visible,
-		// otherwise a fresh capture of the accumulated render.
-		const showingDenoised =
-			this.denoiseCanvas && this.denoisedAtSamples > 0 && this.denoiseEnabled;
-		const source = showingDenoised ? this.denoiseCanvas! : this.renderer.domElement;
-		if (!showingDenoised) {
-			// Redraw, then capture in the same task so the buffer is still valid.
+	/**
+	 * Render the scene at a fixed square resolution and download it as a PNG.
+	 * Independent of viewport/display: the renderer is temporarily resized to
+	 * size×size at pixel-ratio 1 and a square camera, converged to
+	 * EXPORT_SAMPLES, captured, then the interactive view is restored.
+	 */
+	async exportPNG(size: number, filename = 'pt-lab.png', onProgress?: (frac: number) => void) {
+		if (!this.ready || this.exporting) return;
+		this.exporting = true;
+		this.hideDenoise();
+
+		const logical = this.renderer.getSize(new Vector2());
+		const prevPixelRatio = this.renderer.getPixelRatio();
+		const prevAspect = this.camera.aspect;
+		const prevRenderScale = this.pathTracer.renderScale;
+		const prevEnabled = this.pathTracer.enablePathTracing;
+		const prevPaused = this.pathTracer.pausePathTracing;
+
+		this.renderer.setPixelRatio(1);
+		this.renderer.setSize(size, size, false);
+		this.camera.aspect = 1;
+		this.camera.updateProjectionMatrix();
+		this.pathTracer.renderScale = 1;
+		this.pathTracer.enablePathTracing = true;
+		this.pathTracer.pausePathTracing = false;
+		this.pathTracer.updateCamera();
+		this.pathTracer.reset();
+
+		try {
+			while (this.pathTracer.samples < EXPORT_SAMPLES && !this.disposed) {
+				this.pathTracer.renderSample();
+				onProgress?.(this.pathTracer.samples / EXPORT_SAMPLES);
+				await new Promise(requestAnimationFrame);
+			}
+			if (this.disposed) return;
+			onProgress?.(1);
+			// Redraw and capture in the SAME tick: the WebGL drawing buffer isn't
+			// preserved across composites, so an intervening frame would blank it.
 			this.pathTracer.renderSample();
+			await new Promise<void>((resolve) => {
+				this.renderer.domElement.toBlob((blob) => {
+					if (blob) {
+						const url = URL.createObjectURL(blob);
+						const a = document.createElement('a');
+						a.href = url;
+						a.download = filename;
+						a.click();
+						URL.revokeObjectURL(url);
+					}
+					resolve();
+				});
+			});
+		} finally {
+			this.renderer.setPixelRatio(prevPixelRatio);
+			this.renderer.setSize(logical.x, logical.y, false);
+			this.camera.aspect = prevAspect;
+			this.camera.updateProjectionMatrix();
+			this.pathTracer.renderScale = prevRenderScale;
+			this.pathTracer.enablePathTracing = prevEnabled;
+			this.pathTracer.pausePathTracing = prevPaused;
+			this.pathTracer.updateCamera();
+			this.pathTracer.reset();
+			this.lastResetAt = performance.now();
+			this.exporting = false;
 		}
-		source.toBlob((blob) => {
-			if (!blob) return;
-			const url = URL.createObjectURL(blob);
-			const a = document.createElement('a');
-			a.href = url;
-			a.download = filename;
-			a.click();
-			URL.revokeObjectURL(url);
-		});
 	}
 
 	dispose() {

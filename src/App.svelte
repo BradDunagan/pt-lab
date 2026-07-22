@@ -191,6 +191,22 @@
 	let maxSamplesIndex = $state(0);
 	const maxSamples = $derived(MAX_SAMPLES_STOPS[maxSamplesIndex]);
 
+	const EXPORT_SIZES = [64, 128, 256, 512, 1024];
+	let exportSize = $state(512);
+	let exporting = $state(false);
+	let exportProgress = $state(0);
+
+	async function savePNG() {
+		if (!lab) return;
+		exporting = true;
+		exportProgress = 0;
+		try {
+			await lab.exportPNG(exportSize, 'pt-lab.png', (f) => (exportProgress = f));
+		} finally {
+			exporting = false;
+		}
+	}
+
 	$effect(() => {
 		lab?.setEditMode(editMode);
 	});
@@ -409,7 +425,18 @@
 			<input type="range" min="0" max="3" step="0.05" bind:value={envIntensity} />
 		</label>
 
-		<button onclick={() => lab?.savePNG()} disabled={!rendering}>Save PNG</button>
+		<label>
+			Export size
+			<select bind:value={exportSize} disabled={exporting}>
+				{#each EXPORT_SIZES as s (s)}
+					<option value={s}>{s} × {s}</option>
+				{/each}
+			</select>
+		</label>
+
+		<button onclick={savePNG} disabled={!rendering || exporting}>
+			{exporting ? `Rendering… ${Math.round(exportProgress * 100)}%` : 'Save PNG'}
+		</button>
 
 		<div class="status">
 			<div><span class="key">Mode</span><span>{status.mode}{converged ? ' · converged' : ''}</span></div>
