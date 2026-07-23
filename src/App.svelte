@@ -2,6 +2,8 @@
 	import PathTracerViewer from './lib/PathTracerViewer.svelte';
 	import TransformPanel from './lib/TransformPanel.svelte';
 	import MaterialPanel from './lib/MaterialPanel.svelte';
+	import BundleTree from './lib/BundleTree.svelte';
+	import { bundledTree, bundledIsEmpty, type BundleFile } from './lib/bundled';
 	import { PathTracerLab, type LabStatus, type LabObject, type RoomKind } from './lib/pathtracer';
 	import {
 		listSceneNames,
@@ -107,6 +109,21 @@
 	function removeObject(id: string) {
 		if (selectedId === id) selectedId = null;
 		lab?.removeLibraryObject(id);
+	}
+
+	// Names already in the current library, so the browser can mark them.
+	const importedNames = $derived(new Set(objects.map((o) => o.name)));
+
+	async function importBundled(file: BundleFile) {
+		if (!lab || importedNames.has(file.name)) return;
+		importError = '';
+		try {
+			const res = await fetch(file.url);
+			if (!res.ok) throw new Error(`fetch ${res.status}`);
+			await lab.importGLB(await res.arrayBuffer(), file.name);
+		} catch {
+			importError = `Couldn't import ${file.name}.`;
+		}
 	}
 
 	const ROOM_OPTIONS: { value: RoomKind; label: string }[] = [
@@ -321,6 +338,15 @@
 					onchange={onImportFile}
 					hidden
 				/>
+
+				{#if !bundledIsEmpty}
+					<details class="group">
+						<summary>Bundled objects</summary>
+						<div class="bundle-tree">
+							<BundleTree node={bundledTree} {importedNames} onimport={importBundled} />
+						</div>
+					</details>
+				{/if}
 
 				{#if selectedId && selectedMaterial}
 					<details class="group" open>
@@ -702,6 +728,12 @@
 	.obj-import {
 		padding: 0.5rem 0.75rem;
 		border-top: 1px solid #2a2a33;
+	}
+
+	.bundle-tree {
+		padding: 0.4rem 0.6rem 0.6rem;
+		max-height: 40vh;
+		overflow-y: auto;
 	}
 
 	.obj-import .editor-btn {
