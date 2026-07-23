@@ -73,7 +73,16 @@ Scenes are named and saved to localStorage (**New** / **Save…** / **Delete**).
 
 **Bundled objects**: a "Bundled objects" browser (in the Objects group) lists `.glb` files that ship with the app under `src/assets/imports/`, as a tree mirroring the folder layout. `src/lib/bundled.ts` enumerates them at build time with `import.meta.glob('../assets/imports/**/*.glb', { query: '?url', eager: true })` and assembles the flat result into a directory tree — drop a new file or subdirectory into `assets/imports/` and it appears automatically, no manifest to maintain. Clicking a file fetches its URL and runs it through the same `importGLB` as the file picker (so it joins the persistent library); files already in the library are marked and disabled.
 
-Recommended Blender export: **File → Export → glTF 2.0**, format **glTF Binary (.glb)**. Use the **Principled BSDF** (its base color, roughness, metallic, transmission, IOR, and emission map to the material via KHR extensions). **Turn off Draco / mesh compression** — no decompressor is wired in. Apply object transforms (**Ctrl+A → All Transforms**) so the position/rotation/scale sliders behave predictably; the exporter's default **+Y up** is correct. Keep objects simple: the bytes live in localStorage (~5 MB budget shared with scenes), so large or textured models can hit the quota (you'll see a "Storage full" message).
+Recommended Blender export: **File → Export → glTF 2.0**, format **glTF Binary (.glb)**. Use the **Principled BSDF** (its base color, roughness, metallic, transmission, IOR, and emission map to the material via KHR extensions). **Turn off Draco / mesh compression** — no decompressor is wired in. Apply object transforms (**Ctrl+A → All Transforms**) so the position/rotation/scale sliders behave predictably; the exporter's default **+Y up** is correct. Keep meshes simple and untextured — see Storage limits below.
+
+### Storage limits ⚠️
+
+Everything the editor persists lives in the browser's **localStorage**, which is small — roughly **5 MB per origin, shared across all of the app's storage**. Two tiers:
+
+- **Saved scenes** (`pt-lab.scenes`) are lightweight — just references and numbers (room, per-object inclusion/material/transform, camera).
+- **Imported objects** (`pt-lab.library`) are the heavy tier: every import — from the file picker *or* the bundled browser — stores the `.glb` bytes as base64, which inflates the raw file size by ~33%.
+
+So the real constraint is the number and size of imported objects. A handful of simple, untextured meshes (like the letter set) is fine; large or textured models, or many imports, can exhaust the quota. When a save would overflow, **the import is aborted** (nothing already stored is lost) and the app shows a **"Storage full — delete some scenes or objects"** message. Mitigations: keep imported meshes simple and untextured, and remove unused ones with the **×** in the Objects list. If a large *bundled* set ever becomes the bottleneck, the intended fix is to make bundled objects a **non-persisted tier** — loaded from the app's assets each session (they're always available at their URLs) rather than copied into localStorage on import.
 
 ## Integration notes for the larger web app
 

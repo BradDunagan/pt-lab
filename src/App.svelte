@@ -121,8 +121,11 @@
 			const res = await fetch(file.url);
 			if (!res.ok) throw new Error(`fetch ${res.status}`);
 			await lab.importGLB(await res.arrayBuffer(), file.name);
-		} catch {
-			importError = `Couldn't import ${file.name}.`;
+		} catch (err) {
+			importError =
+				err instanceof DOMException && err.name === 'QuotaExceededError'
+					? 'Storage full — delete some scenes or objects.'
+					: `Couldn't import ${file.name}.`;
 		}
 	}
 

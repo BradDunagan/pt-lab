@@ -33,7 +33,7 @@ Assets (Damaged Helmet glTF, HDR environment, denoiser `.tza` weights) are serve
 
 - **Two render modes**: path-traced (`renderSample()`) vs. a fast raster edit mode (`renderer.render()` when `editing`). Object/room/material edits happen in edit mode against the raster view and mark the scene dirty; returning to render rebuilds/updates the tracer.
 - **A scene is data** (`SceneData`: room + per-object state + camera). `buildEditorScene()` rebuilds the whole scene from scratch (floor + object library + room + state), which is why loading a saved scene works from any starting point. The room demos now route through this same path.
-- **Two-tier persistence**: the object library (built-in factories + imported `.glb` templates) is global (`library-store.ts`); named scenes reference objects by key (`scenes.ts`). Both are localStorage. Material props are exposed as artist terms (shininess = `1 − roughness`, reflectivity = `metalness`).
+- **Two-tier persistence**: the object library (built-in factories + imported `.glb` templates) is global (`library-store.ts`); named scenes reference objects by key (`scenes.ts`). Both are localStorage (~5 MB origin quota) — imported `.glb` bytes (base64 in `library-store`) are the heavy tier and can exhaust it; a save that would overflow aborts the import with a "Storage full" message. Material props are exposed as artist terms (shininess = `1 − roughness`, reflectivity = `metalness`).
 - Keep the framework boundary: the editor API is plain-data methods/callbacks (`listObjects`, `setObjectMaterial`, `serializeScene`, `applyScene`, `importGLB`, `onObjectsChanged`) — no three.js types cross into Svelte.
 
 ## Path-tracer behavior that shapes the code
