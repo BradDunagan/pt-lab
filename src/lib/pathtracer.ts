@@ -808,10 +808,16 @@ export class PathTracerLab {
 		const prevAutoClear = renderer.autoClear;
 		const prevClearColor = renderer.getClearColor(new Color());
 		const prevClearAlpha = renderer.getClearAlpha();
+		// The path tracer renders in tiles and leaves scissor test enabled,
+		// clipped to the last tile. Left on, it would clip both the clear and
+		// the render of these aux passes to that tile, leaving the rest of the
+		// buffer at the clear color (the bug that blanked part of the export).
+		const prevScissorTest = renderer.getScissorTest();
 
 		renderer.toneMapping = NoToneMapping;
 		this.scene.background = null;
 		renderer.autoClear = true;
+		renderer.setScissorTest(false);
 
 		// Render targets draw in linear working space regardless of the
 		// renderer's output color space; an SRGB texture makes the GPU encode
@@ -867,6 +873,7 @@ export class PathTracerLab {
 			renderer.setClearColor(prevClearColor, prevClearAlpha);
 			renderer.toneMapping = prevToneMapping;
 			renderer.autoClear = prevAutoClear;
+			renderer.setScissorTest(prevScissorTest);
 			this.scene.background = prevBackground;
 			albedoRT.dispose();
 			normalRT.dispose();
