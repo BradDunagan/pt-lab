@@ -141,6 +141,10 @@ const ENV_URL = `${import.meta.env.BASE_URL}assets/royal_esplanade_1k.hdr`;
 // Samples a fixed-size PNG export converges to before it's written. Small
 // export sizes reach this quickly; 1024² takes a few seconds (progress shown).
 const EXPORT_SAMPLES = 300;
+// The OIDN denoiser pads inputs smaller than its tile size and the padding
+// (garbage) bleeds into the image via the UNet's receptive field, wrecking
+// small denoised exports. So denoise at >= this size, then downscale.
+const DENOISE_MIN_SIZE = 256;
 
 /** ?scene=procedural | room | room-emissive | room-arealight forces an alternate scene instead of the helmet. */
 function sceneParam(): string | null {
@@ -1309,22 +1313,27 @@ export class PathTracerLab {
 		const prevEnabled = this.pathTracer.enablePathTracing;
 		const prevPaused = this.pathTracer.pausePathTracing;
 
-		this.renderer.setPixelRatio(1);
-		this.renderer.setSize(size, size, false);
-		this.camera.aspect = 1;
-		this.camera.updateProjectionMatrix();
-		this.pathTracer.renderScale = 1;
-		this.pathTracer.enablePathTracing = true;
-		this.pathTracer.pausePathTracing = false;
-		this.pathTracer.updateCamera();
-		this.pathTracer.reset();
-
 		try {
 			// If denoising is on, make sure the right UNet is loaded before we
 			// converge (so the export waits for it rather than skipping).
 			if (this.denoiseEnabled) await this.prepareUNet();
+			if (this.disposed) return;
 			const unet = this.denoiseEnabled ? this.activeUNet() : null;
+			// Render (and denoise) at renderSize, then downscale to the requested
+			// size — the denoiser needs at least its tile size to avoid padding
+			// artifacts (see DENOISE_MIN_SIZE).
+			const renderSize = unet ? Math.max(size, DENOISE_MIN_SIZE) : size;
 			const convergeSpan = unet ? 0.85 : 1; // leave headroom for the denoise phase
+
+			this.renderer.setPixelRatio(1);
+			this.renderer.setSize(renderSize, renderSize, false);
+			this.camera.aspect = 1;
+			this.camera.updateProjectionMatrix();
+			this.pathTracer.renderScale = 1;
+			this.pathTracer.enablePathTracing = true;
+			this.pathTracer.pausePathTracing = false;
+			this.pathTracer.updateCamera();
+			this.pathTracer.reset();
 
 			while (this.pathTracer.samples < EXPORT_SAMPLES && !this.disposed) {
 				this.pathTracer.renderSample();
@@ -1336,18 +1345,18 @@ export class PathTracerLab {
 			// Redraw and snapshot the color in the SAME tick: the WebGL drawing
 			// buffer isn't preserved across composites, so a later frame blanks it.
 			this.pathTracer.renderSample();
-			this.captureCanvas.width = size;
-			this.captureCanvas.height = size;
+			this.captureCanvas.width = renderSize;
+			this.captureCanvas.height = renderSize;
 			const ctx = this.captureCanvas.getContext('2d', { willReadFrequently: true })!;
 			ctx.drawImage(this.renderer.domElement, 0, 0);
-			let image = ctx.getImageData(0, 0, size, size);
+			let image = ctx.getImageData(0, 0, renderSize, renderSize);
 
 			// Denoise the export using the same UNet / aux choice as the live view.
 			if (unet) {
 				let aux: { albedo: ImageData; normal: ImageData } | null = null;
 				if (unet === this.unetAux) {
 					try {
-						aux = this.captureAuxBuffers(size, size);
+						aux = this.captureAuxBuffers(renderSize, renderSize);
 					} catch (err) {
 						console.warn('Aux capture failed during export; denoising color-only:', err);
 					}
@@ -1366,10 +1375,22 @@ export class PathTracerLab {
 			}
 			onProgress?.(1);
 
+			// Write out at the requested size, downscaling if we rendered larger.
 			const out = document.createElement('canvas');
 			out.width = size;
 			out.height = size;
-			out.getContext('2d')!.putImageData(image, 0, 0);
+			const octx = out.getContext('2d')!;
+			if (renderSize === size) {
+				octx.putImageData(image, 0, 0);
+			} else {
+				const tmp = document.createElement('canvas');
+				tmp.width = renderSize;
+				tmp.height = renderSize;
+				tmp.getContext('2d')!.putImageData(image, 0, 0);
+				octx.imageSmoothingEnabled = true;
+				octx.imageSmoothingQuality = 'high';
+				octx.drawImage(tmp, 0, 0, size, size);
+			}
 			await new Promise<void>((resolve) => {
 				out.toBlob((blob) => {
 					if (blob) {
