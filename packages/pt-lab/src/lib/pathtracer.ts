@@ -72,6 +72,19 @@ export interface LabOptions {
 	onStatus?: (status: LabStatus) => void;
 	/** Overlay canvas the denoised image is drawn onto (shown via opacity). */
 	denoiseCanvas?: HTMLCanvasElement;
+	/**
+	 * Asset URLs. Default to `${BASE_URL}assets/…` so a host that serves those
+	 * files in its public dir works out of the box; consumers of the package
+	 * can point these at their own assets.
+	 */
+	modelUrl?: string;
+	envUrl?: string;
+	denoiserWeights?: {
+		/** Color-only LDR weights. */
+		ldr?: string;
+		/** LDR + albedo/normal aux weights. */
+		ldrAux?: string;
+	};
 }
 
 /** An editor-addressable object in the scene (plain data — no three.js types). */
@@ -135,8 +148,11 @@ export interface SceneData {
 const RAD2DEG = 180 / Math.PI;
 const DEG2RAD = Math.PI / 180;
 
-const MODEL_URL = `${import.meta.env.BASE_URL}assets/damaged-helmet.glb`;
-const ENV_URL = `${import.meta.env.BASE_URL}assets/royal_esplanade_1k.hdr`;
+const ASSET_BASE = `${import.meta.env.BASE_URL}assets/`;
+const DEFAULT_MODEL_URL = `${ASSET_BASE}damaged-helmet.glb`;
+const DEFAULT_ENV_URL = `${ASSET_BASE}royal_esplanade_1k.hdr`;
+const DEFAULT_LDR_WEIGHTS = `${ASSET_BASE}rt_ldr.tza`;
+const DEFAULT_LDR_AUX_WEIGHTS = `${ASSET_BASE}rt_ldr_alb_nrm.tza`;
 
 // Samples a fixed-size PNG export converges to before it's written. Small
 // export sizes reach this quickly; 1024² takes a few seconds (progress shown).
@@ -255,6 +271,10 @@ export class PathTracerLab {
 	private buildingScene = false;
 
 	private denoiseCanvas?: HTMLCanvasElement;
+	private modelUrl: string;
+	private envUrl: string;
+	private ldrWeightsUrl: string;
+	private ldrAuxWeightsUrl: string;
 	private captureCanvas = document.createElement('canvas');
 	private denoiseEnabled = false;
 	private denoiseState: DenoiseState = 'off';
@@ -280,6 +300,10 @@ export class PathTracerLab {
 	constructor(canvas: HTMLCanvasElement, options: LabOptions = {}) {
 		this.onStatus = options.onStatus;
 		this.denoiseCanvas = options.denoiseCanvas;
+		this.modelUrl = options.modelUrl ?? DEFAULT_MODEL_URL;
+		this.envUrl = options.envUrl ?? DEFAULT_ENV_URL;
+		this.ldrWeightsUrl = options.denoiserWeights?.ldr ?? DEFAULT_LDR_WEIGHTS;
+		this.ldrAuxWeightsUrl = options.denoiserWeights?.ldrAux ?? DEFAULT_LDR_AUX_WEIGHTS;
 
 		this.renderer = new WebGLRenderer({ canvas, antialias: true });
 		this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
@@ -322,7 +346,7 @@ export class PathTracerLab {
 			this.buildEditorScene(demoRoomData(kind as RoomKind));
 		} else {
 			const [hdrEnv, model] = await Promise.all([
-				new HDRLoader().loadAsync(ENV_URL),
+				new HDRLoader().loadAsync(this.envUrl),
 				this.loadModel(),
 			]);
 			if (this.disposed) return;
@@ -358,7 +382,7 @@ export class PathTracerLab {
 	private async loadModel(): Promise<Object3D> {
 		if (sceneParam() === 'procedural') return this.makeProceduralScene();
 		try {
-			const gltf = await new GLTFLoader().loadAsync(MODEL_URL);
+			const gltf = await new GLTFLoader().loadAsync(this.modelUrl);
 			const model = gltf.scene;
 			// Center on origin, resting on the floor plane.
 			const bounds = new Box3().setFromObject(model);
@@ -769,12 +793,9 @@ export class PathTracerLab {
 		const key = aux ? 'aux' : 'plain';
 		if (!this.unetPromises[key]) {
 			// Lazy: oidn-web pulls in tfjs, so only load it on first use.
+			const weightsUrl = aux ? this.ldrAuxWeightsUrl : this.ldrWeightsUrl;
 			this.unetPromises[key] = import('oidn-web').then(({ initUNetFromURL }) =>
-				initUNetFromURL(
-					`${import.meta.env.BASE_URL}assets/${aux ? 'rt_ldr_alb_nrm' : 'rt_ldr'}.tza`,
-					undefined,
-					aux ? { aux: true } : undefined,
-				),
+				initUNetFromURL(weightsUrl, undefined, aux ? { aux: true } : undefined),
 			);
 		}
 		try {

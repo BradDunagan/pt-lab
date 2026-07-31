@@ -4,28 +4,41 @@ This file provides guidance to Claude Code (claude.ai/code) when working with co
 
 ## What this is
 
-A lab for evaluating photo-realistic (not-necessarily-realtime) rendering in the browser with three.js + three-gpu-pathtracer, before building the capability into a larger web app. `docs/what-this-is.md` is the real project documentation — architecture rationale, production caveats, and integration notes live there (the root README.md is just Vite template boilerplate). Keep that doc in sync with meaningful changes.
+A lab for evaluating photo-realistic (not-necessarily-realtime) rendering in the browser with three.js + three-gpu-pathtracer. `docs/what-this-is.md` is the real project documentation — architecture rationale, production caveats, and integration notes live there. Keep that doc in sync with meaningful changes.
+
+## Repository layout (npm workspaces monorepo)
+
+```
+packages/pt-lab/   # the library — the consumable module (path tracer + scene editor)
+packages/demo/     # a demo app that consumes pt-lab and provides the demo assets
+```
+
+`packages/pt-lab` is published/consumed the way `../paneless-workspace/packages/paneless` is: its `package.json` points `svelte`/`main`/`types`/`exports` at `./src/index.ts` (a barrel), so consumers use the **source** (compiled by their own Vite/Svelte). An external app depends on it via a path dependency (`"pt-lab": "../pt-lab-workspace/packages/pt-lab"`) and `import { PathTracerLab, PathTracerViewer, … } from 'pt-lab'`. `packages/demo` is exactly such a consumer, in-repo.
 
 ## Commands
 
+Run `npm install` once at the root (sets up the workspaces). Then:
+
 ```sh
-npm run dev      # Vite dev server
-npm run build    # production build to dist/
-npm run check    # type-check: svelte-check + tsc (build does NOT type-check)
-npm run preview  # serve the built dist/
+npm run dev        # demo dev server (delegates to packages/demo)
+npm run build      # build the demo app
+npm run check      # svelte-check both packages (library + demo)
+npm run pkg:build  # svelte-package the library to packages/pt-lab/dist (publish artifact)
+npm run pkg:dev    # svelte-package --watch
 ```
 
-There are no tests or linters.
+Per-package: `npm run --workspace packages/pt-lab check`, `… --workspace packages/demo check`. There are no tests or linters. `pkg:build` warns about `import.meta.env` — harmless, since consumers use the source (where Vite provides it), not the dist.
 
 ## Architecture
 
-Three layers, with a deliberate framework boundary:
+The library (`packages/pt-lab/src/`) is the reusable core; the demo (`packages/demo/src/`) is one consumer. A deliberate framework boundary runs between them:
 
-- `src/lib/pathtracer.ts` — **the reusable core**, and the piece intended to port into the larger app. `PathTracerLab` is a framework-agnostic class owning the `WebGLRenderer`, scene, `OrbitControls`, and `WebGLPathTracer`. The host UI talks to it only through public methods and the `onStatus` callback — never through three.js internals. Preserve this boundary: don't leak three.js types or objects into the Svelte layer (the boundary exists so the backend can be swapped for WebGPU later).
-- `src/lib/PathTracerViewer.svelte` — thin glue: mounts the class on a canvas, wires `ResizeObserver`, disposes on unmount, exposes `lab` and `status` via `$bindable` props.
-- `src/App.svelte` — control panel + Scene Editor UI. Svelte 5 runes (`$state`/`$effect`/`$derived`); each control pushes into the lab via an `$effect`. Inspector panels (`TransformPanel.svelte`, `MaterialPanel.svelte`) hold a local copy seeded once from the selection and are keyed by object id (`{#key selectedId}`) so switching selection remounts and re-seeds them.
+- `packages/pt-lab/src/lib/pathtracer.ts` — **the reusable core**. `PathTracerLab` is a framework-agnostic class owning the `WebGLRenderer`, scene, `OrbitControls`, and `WebGLPathTracer`. Hosts talk to it only through public methods and callbacks (`onStatus`, `onObjectsChanged`) — never through three.js internals. Preserve this boundary: don't leak three.js types into the Svelte layer (so the backend can be swapped for WebGPU later).
+- `packages/pt-lab/src/lib/PathTracerViewer.svelte` — thin glue: mounts the class on a canvas, wires `ResizeObserver`, disposes on unmount, exposes `lab` and `status` via `$bindable` props.
+- `packages/pt-lab/src/index.ts` — the barrel: exports `PathTracerLab` + types, the components (`PathTracerViewer`, `TransformPanel`, `MaterialPanel`, `BundleTree`), and the persistence/bundled modules.
+- `packages/demo/src/App.svelte` — control panel + Scene Editor UI, importing everything from `'pt-lab'`. Svelte 5 runes (`$state`/`$effect`/`$derived`); each control pushes into the lab via an `$effect`. Inspector panels hold a local copy seeded once from the selection and are keyed by object id (`{#key selectedId}`) so switching selection remounts and re-seeds them.
 
-Assets (Damaged Helmet glTF, HDR environment, denoiser `.tza` weights) are served statically from `public/assets/` and loaded via `import.meta.env.BASE_URL`. If the model fails to load, `PathTracerLab` falls back to a procedural scene.
+Asset URLs (Damaged Helmet glTF, HDR environment, denoiser `.tza` weights) are **configurable via `LabOptions`** (`modelUrl`, `envUrl`, `denoiserWeights`), defaulting to `${import.meta.env.BASE_URL}assets/…`. The demo serves those files from `packages/demo/public/assets/`; other consumers pass their own URLs or provide the files. If the model fails to load, `PathTracerLab` falls back to a procedural scene. Bundled importable objects (`packages/pt-lab/src/assets/imports/`) are enumerated at build time by `bundled.ts` via `import.meta.glob` and travel *with the library*.
 
 ### Scene Editor
 

@@ -1,28 +1,20 @@
 {
-  "name": "pt-lab",
+  "name": "pt-lab-workspace",
   "private": true,
   "version": "0.0.0",
   "type": "module",
+  "workspaces": [
+    "packages/pt-lab",
+    "packages/demo"
+  ],
   "scripts": {
-    "dev": "vite",
-    "build": "vite build",
-    "preview": "vite preview",
-    "check": "svelte-check --tsconfig ./tsconfig.app.json && tsc -p tsconfig.node.json"
-  },
-  "devDependencies": {
-    "@sveltejs/vite-plugin-svelte": "^7.1.2",
-    "@tsconfig/svelte": "^5.0.8",
-    "@types/node": "^24.13.2",
-    "@types/three": "^0.185.1",
-    "svelte": "^5.56.4",
-    "svelte-check": "^4.7.1",
-    "typescript": "~6.0.2",
-    "vite": "^8.1.1"
-  },
-  "dependencies": {
-    "oidn-web": "^0.3.5",
-    "three": "^0.185.1",
-    "three-gpu-pathtracer": "^0.0.24",
-    "three-mesh-bvh": "^0.9.11"
+    "dev": "npm run --workspace packages/demo dev",
+    "build": "npm run --workspace packages/demo build",
+    "preview": "npm run --workspace packages/demo preview",
+    "demo:dev": "npm run --workspace packages/demo dev",
+    "demo:build": "npm run --workspace packages/demo build",
+    "pkg:build": "npm run --workspace packages/pt-lab build",
+    "pkg:dev": "npm run --workspace packages/pt-lab dev",
+    "check": "npm run --workspace packages/pt-lab check && npm run --workspace packages/demo check"
   }
 }

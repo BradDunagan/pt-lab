@@ -16,15 +16,18 @@ This maps well onto "photo-realistic stills": let the tracer run for seconds-to-
 
 ## Project structure
 
+An npm-workspaces monorepo: `packages/pt-lab` is the consumable library, `packages/demo` is an in-repo consumer that supplies the demo assets. The library is used the way `../rr` uses `../paneless-workspace/packages/paneless` — a path dependency exposing `./src/index.ts`, compiled from source by the consumer's Vite. See the root `README.md` for the consumption recipe.
+
 | Path | Role |
 |---|---|
-| `src/lib/pathtracer.ts` | **The reusable core.** Framework-agnostic class wrapping renderer, scene, controls, and `WebGLPathTracer`. Talks to the host UI only through public methods and callbacks (`onStatus`, `onObjectsChanged`). Also owns the Scene Editor model: object registry, room swapping, serialize/apply, and `.glb` import. |
-| `src/lib/PathTracerViewer.svelte` | Thin Svelte binding: mounts the class on a canvas, wires `ResizeObserver`, disposes on unmount. |
-| `src/lib/TransformPanel.svelte`, `MaterialPanel.svelte` | Per-object inspector panels (keyed by object id so they re-seed on selection change). |
-| `src/lib/scenes.ts` | localStorage store for named editor scenes (room + per-object state + camera). |
-| `src/lib/library-store.ts` | localStorage store for imported `.glb` objects (bytes as base64). |
-| `src/App.svelte` | Control panel + status readout + Scene Editor UI (Svelte 5 runes). |
-| `public/assets/` | Demo model + HDR + denoiser weights, served statically. |
+| `packages/pt-lab/src/index.ts` | Public barrel — the module entry (`svelte`/`main`/`types` point here). Exports `PathTracerLab` + types, the components, and the persistence/bundled modules. |
+| `packages/pt-lab/src/lib/pathtracer.ts` | **The reusable core.** Framework-agnostic class wrapping renderer, scene, controls, and `WebGLPathTracer`. Talks to the host only through public methods and callbacks (`onStatus`, `onObjectsChanged`). Also owns the Scene Editor model: object registry, room swapping, serialize/apply, `.glb` import. Asset URLs are configurable via `LabOptions`. |
+| `packages/pt-lab/src/lib/PathTracerViewer.svelte` | Thin Svelte binding: mounts the class on a canvas, wires `ResizeObserver`, disposes on unmount. |
+| `packages/pt-lab/src/lib/TransformPanel.svelte`, `MaterialPanel.svelte`, `BundleTree.svelte` | Inspector panels + the bundled-objects tree. |
+| `packages/pt-lab/src/lib/scenes.ts`, `library-store.ts` | localStorage stores for named scenes and imported `.glb` objects. |
+| `packages/pt-lab/src/lib/bundled.ts` + `src/assets/imports/` | Build-time enumeration of bundled importable objects (travels with the library). |
+| `packages/demo/src/App.svelte` | Control panel + Scene Editor UI (Svelte 5 runes), importing everything from `'pt-lab'`. |
+| `packages/demo/public/assets/` | Demo model + HDR + denoiser weights, served by the demo app. |
 
 ## Scenes
 
@@ -143,9 +146,10 @@ Two size subtleties in the denoise path: OIDN pads any input smaller than its ti
 ## Running
 
 ```sh
-npm install
-npm run dev      # dev server
-npm run build    # type-check happens via `npm run check`; build emits dist/
+npm install      # once, at the workspace root
+npm run dev      # demo dev server (packages/demo)
+npm run check    # type-check both packages (build does not type-check)
+npm run build    # build the demo app
 ```
 
 Orbit with the mouse; release and the image starts converging. **Save PNG** re-renders the scene at a chosen square resolution (64²–1024²) and downloads it.

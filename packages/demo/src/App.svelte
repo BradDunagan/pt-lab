@@ -1,17 +1,22 @@
 <script lang="ts">
-	import PathTracerViewer from './lib/PathTracerViewer.svelte';
-	import TransformPanel from './lib/TransformPanel.svelte';
-	import MaterialPanel from './lib/MaterialPanel.svelte';
-	import BundleTree from './lib/BundleTree.svelte';
-	import { bundledTree, bundledIsEmpty, type BundleFile } from './lib/bundled';
-	import { PathTracerLab, type LabStatus, type LabObject, type RoomKind } from './lib/pathtracer';
 	import {
+		PathTracerViewer,
+		TransformPanel,
+		MaterialPanel,
+		BundleTree,
+		PathTracerLab,
+		bundledTree,
+		bundledIsEmpty,
 		listSceneNames,
 		loadSceneData,
 		saveSceneData,
 		deleteSceneData,
 		newSceneData,
-	} from './lib/scenes';
+		type BundleFile,
+		type LabStatus,
+		type LabObject,
+		type RoomKind,
+	} from 'pt-lab';
 
 	let lab = $state<PathTracerLab | null>(null);
 	let status = $state<LabStatus>({

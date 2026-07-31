@@ -10,6 +10,9 @@ lerna-debug.log*
 node_modules
 dist
 dist-ssr
+.svelte-kit
+*.tsbuildinfo
+tmp
 *.local
 
 # Local reference material (Ray Tracing in One Weekend book source)

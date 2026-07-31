@@ -1,49 +1,55 @@
-# Svelte + TS + Vite
+# pt-lab-workspace
 
-> **Project documentation:** see [docs/what-this-is.md](docs/what-this-is.md) for what this lab is, how the path tracer works, and integration notes. The rest of this README is the stock Vite template.
+Browser GPU path tracing + a data-driven scene editor, built on [three.js](https://threejs.org) and [three-gpu-pathtracer](https://github.com/gkjohnson/three-gpu-pathtracer), packaged as a consumable module.
 
-This template should help get you started developing with Svelte and TypeScript in Vite.
+> **Project documentation:** [docs/what-this-is.md](docs/what-this-is.md) — what this is, how the path tracer and scene editor work, and integration notes.
 
-## Recommended IDE Setup
+## Layout
 
-[VS Code](https://code.visualstudio.com/) + [Svelte](https://marketplace.visualstudio.com/items?itemName=svelte.svelte-vscode).
+This is an npm-workspaces monorepo:
 
-## Need an official Svelte framework?
+| Path | Role |
+|---|---|
+| `packages/pt-lab/` | **The library** — the consumable module (`PathTracerLab` + Svelte components + scene/library persistence). |
+| `packages/demo/` | A demo app that consumes `pt-lab` and provides the demo assets (model, HDR, denoiser weights). |
 
-Check out [SvelteKit](https://github.com/sveltejs/kit#readme), which is also powered by Vite. Deploy anywhere with its serverless-first approach and adapt to various platforms, with out of the box support for TypeScript, SCSS, and Less, and easily-added support for mdsvex, GraphQL, PostCSS, Tailwind CSS, and more.
+## Develop
 
-## Technical considerations
+```sh
+npm install        # once, at the root — sets up the workspaces
+npm run dev        # demo dev server
+npm run build      # build the demo app
+npm run check      # type-check both packages
+npm run pkg:build  # build the library publish artifact (packages/pt-lab/dist)
+```
 
-**Why use this over SvelteKit?**
+## Use as a module
 
-- It brings its own routing solution which might not be preferable for some users.
-- It is first and foremost a framework that just happens to use Vite under the hood, not a Vite app.
+`packages/pt-lab` is consumed the way [`rr`](../rr) consumes `paneless` — a local path dependency whose `package.json` exposes `./src/index.ts`, so the consumer's own Vite/Svelte compiles the source.
 
-This template contains as little as possible to get started with Vite + TypeScript + Svelte, while taking into account the developer experience with regards to HMR and intellisense. It demonstrates capabilities on par with the other `create-vite` templates and is a good starting point for beginners dipping their toes into a Vite + Svelte project.
+In the consuming app's `package.json`:
 
-Should you later need the extended capabilities and extensibility provided by SvelteKit, the template has been structured similarly to SvelteKit so that it is easy to migrate.
+```json
+{
+  "dependencies": {
+    "pt-lab": "../pt-lab-workspace/packages/pt-lab"
+  }
+}
+```
 
-**Why `global.d.ts` instead of `compilerOptions.types` inside `jsconfig.json` or `tsconfig.json`?**
-
-Setting `compilerOptions.types` shuts out all other types not explicitly listed in the configuration. Using triple-slash references keeps the default TypeScript setting of accepting type information from the entire workspace, while also adding `svelte` and `vite/client` type information.
-
-**Why include `.vscode/extensions.json`?**
-
-Other templates indirectly recommend extensions via the README, but this file allows VS Code to prompt the user to install the recommended extension upon opening the project.
-
-**Why enable `allowJs` in the TS template?**
-
-While `allowJs: false` would indeed prevent the use of `.js` files in the project, it does not prevent the use of JavaScript syntax in `.svelte` files. In addition, it would force `checkJs: false`, bringing the worst of both worlds: not being able to guarantee the entire codebase is TypeScript, and also having worse typechecking for the existing JavaScript. In addition, there are valid use cases in which a mixed codebase may be relevant.
-
-**Why is HMR not preserving my local component state?**
-
-HMR state preservation comes with a number of gotchas! It has been disabled by default in both `svelte-hmr` and `@sveltejs/vite-plugin-svelte` due to its often surprising behavior. You can read the details [here](https://github.com/rixo/svelte-hmr#svelte-hmr).
-
-If you have state that's important to retain within a component, consider creating an external store which would not be replaced by HMR.
+Then:
 
 ```ts
-// store.ts
-// An extremely simple external store
-import { writable } from 'svelte/store'
-export default writable(0)
+import { PathTracerLab, PathTracerViewer } from 'pt-lab';
+
+const lab = new PathTracerLab(canvas, {
+  onStatus: (s) => { /* … */ },
+  // Asset URLs default to `${BASE_URL}assets/…`; point them at your own:
+  modelUrl: '/assets/my-model.glb',
+  envUrl: '/assets/my-env.hdr',
+  denoiserWeights: { ldr: '/assets/rt_ldr.tza', ldrAux: '/assets/rt_ldr_alb_nrm.tza' },
+});
+await lab.init();
 ```
+
+The consumer must provide the model, HDR, and denoiser-weight files it points at (the demo keeps a working set in `packages/demo/public/assets/`). The bundled importable objects under `packages/pt-lab/src/assets/imports/` travel with the library automatically.
