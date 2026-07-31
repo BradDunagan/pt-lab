@@ -1344,6 +1344,18 @@ export class PathTracerLab {
 		this.afterCameraChange();
 	}
 
+	/** Current vertical field of view, in degrees. */
+	getCameraFov(): number {
+		return this.camera.fov;
+	}
+
+	/** Set the vertical field of view (degrees) — lower zooms in, higher widens. */
+	setCameraFov(fov: number) {
+		this.camera.fov = fov;
+		this.camera.updateProjectionMatrix();
+		this.afterCameraChange();
+	}
+
 	/**
 	 * Sync OrbitControls to a programmatic camera change and restart
 	 * accumulation — live in the raster edit view, tracer reset in render mode.
