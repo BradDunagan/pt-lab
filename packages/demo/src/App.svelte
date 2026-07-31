@@ -17,6 +17,7 @@
 		type LabObject,
 		type RoomKind,
 	} from 'pt-lab';
+	import CameraControls from './CameraControls.svelte';
 
 	let lab = $state<PathTracerLab | null>(null);
 	let status = $state<LabStatus>({
@@ -260,6 +261,14 @@
 	const elapsed = $derived((status.elapsedMs / 1000).toFixed(1));
 	const converged = $derived(maxSamples > 0 && status.samples >= maxSamples);
 	const rendering = $derived(status.mode === 'pathtracing' || status.mode === 'raster');
+	// Live camera readout — recomputes every frame (status ticks each frame),
+	// so orbiting the viewport updates the Camera controls too.
+	const cameraState = $derived.by(() => {
+		void status;
+		return lab
+			? { position: lab.getCameraPosition(), target: lab.getCameraTarget(), fov: lab.getCameraFov() }
+			: null;
+	});
 	const denoiseText = $derived(
 		{
 			off: '',
@@ -458,6 +467,18 @@
 			Environment <span>{envIntensity.toFixed(2)}</span>
 			<input type="range" min="0" max="3" step="0.05" bind:value={envIntensity} />
 		</label>
+
+		{#if cameraState}
+			<details class="group">
+				<summary>Camera</summary>
+				<CameraControls
+					{lab}
+					position={cameraState.position}
+					target={cameraState.target}
+					fov={cameraState.fov}
+				/>
+			</details>
+		{/if}
 
 		<label>
 			Export size
