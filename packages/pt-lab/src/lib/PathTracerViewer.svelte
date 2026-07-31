@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { onMount } from 'svelte';
-	import { PathTracerLab, type LabStatus } from './pathtracer';
+	import { PathTracerLab, type LabStatus, type LabOptions } from './pathtracer';
 
 	let {
 		lab = $bindable(null),
@@ -12,9 +12,16 @@
 			denoisedAt: 0,
 			denoiseAux: true,
 		}),
+		options = {},
 	}: {
 		lab: PathTracerLab | null;
 		status: LabStatus;
+		/**
+		 * Forwarded to the PathTracerLab constructor (e.g. asset URLs). The
+		 * viewer always supplies its own onStatus (drives bind:status) and
+		 * denoiseCanvas (it owns the overlay), so those two are ignored here.
+		 */
+		options?: LabOptions;
 	} = $props();
 
 	let container: HTMLDivElement;
@@ -23,6 +30,7 @@
 
 	onMount(() => {
 		const instance = new PathTracerLab(canvas, {
+			...options,
 			onStatus: (s) => (status = s),
 			denoiseCanvas,
 		});
