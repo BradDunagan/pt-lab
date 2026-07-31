@@ -1321,14 +1321,34 @@ export class PathTracerLab {
 		return [this.camera.position.x, this.camera.position.y, this.camera.position.z];
 	}
 
+	/** Current orbit target — the point the camera looks at. */
+	getCameraTarget(): [number, number, number] {
+		return [this.controls.target.x, this.controls.target.y, this.controls.target.z];
+	}
+
 	/**
-	 * Move the camera. It keeps looking at the current orbit target, so this
-	 * repositions without changing what's framed's center. Restarts
-	 * accumulation (raster shows it live; render mode resets the tracer).
+	 * Move the camera, keeping the current orbit target as its look-at (so it
+	 * repositions without changing what it's aimed at).
 	 */
 	setCameraPosition(x: number, y: number, z: number) {
 		this.camera.position.set(x, y, z);
-		// Re-sync OrbitControls' internal spherical state to the new position.
+		this.afterCameraChange();
+	}
+
+	/**
+	 * Aim the camera at a new point, keeping its position (so it re-orients in
+	 * place). Subsequent orbiting rotates around this target.
+	 */
+	setCameraTarget(x: number, y: number, z: number) {
+		this.controls.target.set(x, y, z);
+		this.afterCameraChange();
+	}
+
+	/**
+	 * Sync OrbitControls to a programmatic camera change and restart
+	 * accumulation — live in the raster edit view, tracer reset in render mode.
+	 */
+	private afterCameraChange() {
 		this.controls.update();
 		this.hideDenoise();
 		if (this.ready && !this.editing) {
