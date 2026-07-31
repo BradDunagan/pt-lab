@@ -314,6 +314,18 @@
 					</select>
 				</label>
 
+				{#if cameraState}
+					<details class="group">
+						<summary>Camera</summary>
+						<CameraControls
+							{lab}
+							position={cameraState.position}
+							target={cameraState.target}
+							fov={cameraState.fov}
+						/>
+					</details>
+				{/if}
+
 				<details class="group" open>
 					<summary>Objects</summary>
 					{#if objects.length}
