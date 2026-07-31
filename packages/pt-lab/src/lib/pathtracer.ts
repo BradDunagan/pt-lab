@@ -1316,6 +1316,28 @@ export class PathTracerLab {
 		if (this.ready) this.pathTracer.updateCamera();
 	}
 
+	/** Current camera position in world space. */
+	getCameraPosition(): [number, number, number] {
+		return [this.camera.position.x, this.camera.position.y, this.camera.position.z];
+	}
+
+	/**
+	 * Move the camera. It keeps looking at the current orbit target, so this
+	 * repositions without changing what's framed's center. Restarts
+	 * accumulation (raster shows it live; render mode resets the tracer).
+	 */
+	setCameraPosition(x: number, y: number, z: number) {
+		this.camera.position.set(x, y, z);
+		// Re-sync OrbitControls' internal spherical state to the new position.
+		this.controls.update();
+		this.hideDenoise();
+		if (this.ready && !this.editing) {
+			this.pathTracer.updateCamera();
+			this.pathTracer.reset();
+			this.lastResetAt = performance.now();
+		}
+	}
+
 	/**
 	 * Render the scene at a fixed square resolution and download it as a PNG.
 	 * Independent of viewport/display: the renderer is temporarily resized to
