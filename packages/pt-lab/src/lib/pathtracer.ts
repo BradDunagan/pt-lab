@@ -39,13 +39,7 @@ import { HDRLoader } from 'three/addons/loaders/HDRLoader.js';
 import { RectAreaLightUniformsLib } from 'three/addons/lights/RectAreaLightUniformsLib.js';
 import { WebGLPathTracer } from 'three-gpu-pathtracer';
 import type { UNet } from 'oidn-web';
-import {
-	listImports,
-	saveImport,
-	deleteImport,
-	arrayBufferToBase64,
-	base64ToArrayBuffer,
-} from './library-store';
+import { listImports, saveImport, deleteImport } from './library-store';
 
 export type RenderMode = 'loading' | 'building-bvh' | 'raster' | 'pathtracing' | 'editing';
 
@@ -1196,9 +1190,9 @@ export class PathTracerLab {
 
 	/** Parse each persisted import into a reusable template Object3D. */
 	private async loadImports() {
-		for (const rec of listImports()) {
+		for (const rec of await listImports()) {
 			try {
-				const template = await this.parseGLB(base64ToArrayBuffer(rec.glbBase64));
+				const template = await this.parseGLB(rec.glb);
 				this.importTemplates.set(rec.key, template);
 				this.library.push({ key: rec.key, name: rec.name, kind: 'imported' });
 			} catch (err) {
@@ -1226,7 +1220,7 @@ export class PathTracerLab {
 		const key = `import-${Date.now().toString(36)}-${this.importCounter++}`;
 		const name = filename.replace(/\.(glb|gltf)$/i, '').trim() || 'Imported';
 		// Persist first so a quota failure aborts before we mutate state.
-		saveImport({ key, name, glbBase64: arrayBufferToBase64(buffer) });
+		await saveImport({ key, name, glb: buffer });
 		this.importTemplates.set(key, template);
 		this.library.push({ key, name, kind: 'imported' });
 
@@ -1249,7 +1243,7 @@ export class PathTracerLab {
 			disposeObject(template);
 			this.importTemplates.delete(key);
 		}
-		deleteImport(key);
+		void deleteImport(key).catch((err) => console.warn('Failed to delete import:', err));
 		for (const [id, entry] of [...this.objects]) {
 			if (entry.key === key) {
 				this.scene.remove(entry.object3d);
