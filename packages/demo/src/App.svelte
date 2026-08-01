@@ -233,6 +233,41 @@
 		}
 	}
 
+	// Rotation-series export — a beauty + object-space-position pair per angle,
+	// for building feature-response datasets (world-lab Demo 8).
+	let seriesAxis = $state<'x' | 'y' | 'z'>('y');
+	let seriesFrom = $state(0);
+	let seriesTo = $state(90);
+	let seriesStep = $state(15);
+	let seriesBase = $state('helmet');
+	let seriesSamples = $state(96);
+	let seriesRunning = $state(false);
+	let seriesProgress = $state(0);
+	let seriesLabel = $state('');
+
+	async function runSeries() {
+		if (!lab || !selectedId) return;
+		seriesRunning = true;
+		seriesProgress = 0;
+		try {
+			await lab.exportRotationSeries(selectedId, {
+				axis: seriesAxis,
+				from: seriesFrom,
+				to: seriesTo,
+				step: seriesStep,
+				size: exportSize,
+				samples: seriesSamples,
+				baseName: seriesBase,
+				onProgress: (f, label) => {
+					seriesProgress = f;
+					seriesLabel = label;
+				},
+			});
+		} finally {
+			seriesRunning = false;
+		}
+	}
+
 	$effect(() => {
 		lab?.setEditMode(editMode);
 	});
@@ -504,6 +539,39 @@
 		<button onclick={savePNG} disabled={!rendering || exporting}>
 			{exporting ? `Rendering… ${Math.round(exportProgress * 100)}%` : 'Save PNG'}
 		</button>
+
+		<details class="series">
+			<summary>Rotation-series export</summary>
+			<p class="hint">
+				Select an object, then export a beauty + object-space-position pair per angle (for
+				feature-response datasets). Uses the Export size above.
+			</p>
+			<div style="display:grid; grid-template-columns:auto 1fr; gap:0.35rem 0.5rem; align-items:center; margin-bottom:0.5rem;">
+				<span>Axis</span>
+				<select bind:value={seriesAxis} disabled={seriesRunning}>
+					<option value="x">x</option>
+					<option value="y">y</option>
+					<option value="z">z</option>
+				</select>
+				<span>From°</span>
+				<input type="number" bind:value={seriesFrom} disabled={seriesRunning} />
+				<span>To°</span>
+				<input type="number" bind:value={seriesTo} disabled={seriesRunning} />
+				<span>Step°</span>
+				<input type="number" bind:value={seriesStep} disabled={seriesRunning} />
+				<span>Samples</span>
+				<input type="number" bind:value={seriesSamples} disabled={seriesRunning} />
+				<span>Name</span>
+				<input type="text" bind:value={seriesBase} disabled={seriesRunning} />
+			</div>
+			<button onclick={runSeries} disabled={!rendering || seriesRunning || exporting || !selectedId}>
+				{seriesRunning
+					? `Exporting… ${Math.round(seriesProgress * 100)}% ${seriesLabel}`
+					: selectedId
+						? 'Export rotation series'
+						: 'Select an object first'}
+			</button>
+		</details>
 
 		<div class="status">
 			<div><span class="key">Mode</span><span>{status.mode}{converged ? ' · converged' : ''}</span></div>

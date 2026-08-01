@@ -20,6 +20,7 @@ import {
 	PlaneGeometry,
 	RGBAFormat,
 	Scene,
+	ShaderMaterial,
 	SphereGeometry,
 	SRGBColorSpace,
 	TorusKnotGeometry,
@@ -296,6 +297,31 @@ export class PathTracerLab {
 	private auxCache: { albedo: ImageData; normal: ImageData } | null = null;
 	private normalMaterial = new MeshNormalMaterial();
 	private basicMirrors = new WeakMap<Material, MeshBasicMaterial>();
+	// Object-space-position G-buffer: outputs each fragment's LOCAL vertex
+	// position, normalized to the object's bounding box, into RGB (alpha = 1 as a
+	// coverage mask). Because it's the *local* position (pre-world-transform), the
+	// same surface point yields the same color under any rotation — a ground-truth
+	// correspondence label used only for scoring feature matchers (Demo 7/8). Only
+	// used in an off-screen raster pass, never handed to the path tracer.
+	private positionMaterial = new ShaderMaterial({
+		uniforms: { uMin: { value: new Vector3() }, uInvSize: { value: new Vector3(1, 1, 1) } },
+		vertexShader: /* glsl */ `
+			varying vec3 vPos;
+			void main() {
+				vPos = position;
+				gl_Position = projectionMatrix * modelViewMatrix * vec4(position, 1.0);
+			}
+		`,
+		fragmentShader: /* glsl */ `
+			uniform vec3 uMin;
+			uniform vec3 uInvSize;
+			varying vec3 vPos;
+			void main() {
+				vec3 n = clamp((vPos - uMin) * uInvSize, 0.0, 1.0);
+				gl_FragColor = vec4(n, 1.0);
+			}
+		`,
+	});
 
 	constructor(canvas: HTMLCanvasElement, options: LabOptions = {}) {
 		this.onStatus = options.onStatus;
@@ -1480,6 +1506,207 @@ export class PathTracerLab {
 				});
 			});
 		} finally {
+			this.renderer.setPixelRatio(prevPixelRatio);
+			this.renderer.setSize(logical.x, logical.y, false);
+			this.camera.aspect = prevAspect;
+			this.camera.updateProjectionMatrix();
+			this.pathTracer.renderScale = prevRenderScale;
+			this.pathTracer.enablePathTracing = prevEnabled;
+			this.pathTracer.pausePathTracing = prevPaused;
+			this.pathTracer.updateCamera();
+			this.pathTracer.reset();
+			this.lastResetAt = performance.now();
+			this.exporting = false;
+		}
+	}
+
+	/**
+	 * Render ONLY the target object with the object-space-position material into an
+	 * off-screen buffer. RGB = local position normalized to the object's bbox;
+	 * alpha = coverage mask (255 on the object, 0 on background). Same encoding
+	 * every frame, so a given surface point has identical RGB under any rotation.
+	 */
+	private capturePositionBuffer(targetId: string, width: number, height: number): ImageData | null {
+		const entry = this.objects.get(targetId);
+		if (!entry) return null;
+		const target = entry.object3d;
+		const renderer = this.renderer;
+
+		const prevToneMapping = renderer.toneMapping;
+		const prevBackground = this.scene.background;
+		const prevAutoClear = renderer.autoClear;
+		const prevClearColor = renderer.getClearColor(new Color());
+		const prevClearAlpha = renderer.getClearAlpha();
+		const prevScissorTest = renderer.getScissorTest();
+
+		// Normalize by the object's local bounding box (single-mesh assumption:
+		// all local frames coincide, true for the helmet).
+		const box = new Box3();
+		target.traverse((o) => {
+			const mesh = o as Mesh;
+			if (!mesh.isMesh || !mesh.geometry) return;
+			if (!mesh.geometry.boundingBox) mesh.geometry.computeBoundingBox();
+			if (mesh.geometry.boundingBox) box.union(mesh.geometry.boundingBox);
+		});
+		const size = new Vector3();
+		box.getSize(size);
+		this.positionMaterial.uniforms.uMin.value.copy(box.min);
+		this.positionMaterial.uniforms.uInvSize.value.set(
+			size.x > 1e-6 ? 1 / size.x : 0,
+			size.y > 1e-6 ? 1 / size.y : 0,
+			size.z > 1e-6 ? 1 / size.z : 0,
+		);
+
+		// Render only the target: hide every other mesh.
+		const keep = new Set<Object3D>();
+		target.traverse((o) => keep.add(o));
+		const hidden: Mesh[] = [];
+		this.scene.traverse((o) => {
+			const mesh = o as Mesh;
+			if (mesh.isMesh && !keep.has(mesh) && mesh.visible) {
+				mesh.visible = false;
+				hidden.push(mesh);
+			}
+		});
+
+		const rt = new WebGLRenderTarget(width, height); // 8-bit linear RGBA
+
+		renderer.toneMapping = NoToneMapping;
+		this.scene.background = null;
+		renderer.autoClear = true;
+		renderer.setScissorTest(false);
+		try {
+			this.scene.overrideMaterial = this.positionMaterial;
+			renderer.setClearColor(0x000000, 0); // alpha 0 => background sentinel
+			renderer.setRenderTarget(rt);
+			renderer.render(this.scene, this.camera);
+			this.scene.overrideMaterial = null;
+			return this.readTargetPixels(rt, width, height);
+		} finally {
+			this.scene.overrideMaterial = null;
+			renderer.setRenderTarget(null);
+			renderer.setClearColor(prevClearColor, prevClearAlpha);
+			renderer.toneMapping = prevToneMapping;
+			renderer.autoClear = prevAutoClear;
+			renderer.setScissorTest(prevScissorTest);
+			this.scene.background = prevBackground;
+			for (const mesh of hidden) mesh.visible = true;
+			rt.dispose();
+		}
+	}
+
+	private async downloadImageData(img: ImageData, filename: string): Promise<void> {
+		const c = document.createElement('canvas');
+		c.width = img.width;
+		c.height = img.height;
+		c.getContext('2d')!.putImageData(img, 0, 0);
+		await new Promise<void>((resolve) => {
+			c.toBlob((blob) => {
+				if (blob) {
+					const url = URL.createObjectURL(blob);
+					const a = document.createElement('a');
+					a.href = url;
+					a.download = filename;
+					a.click();
+					URL.revokeObjectURL(url);
+				}
+				resolve();
+			});
+		});
+	}
+
+	/**
+	 * Export a rotation series of the target object: for each angle, rotate,
+	 * path-trace the beauty image, and also capture the object-space-position
+	 * pass. Downloads `<base>-ryNNN.png` (beauty) and `<base>-ryNNN-pos.png`
+	 * (position/mask) per angle. For generating feature-response datasets.
+	 */
+	async exportRotationSeries(
+		targetId: string,
+		opts: {
+			axis?: 'x' | 'y' | 'z';
+			from?: number;
+			to?: number;
+			step?: number;
+			size?: number;
+			samples?: number;
+			baseName?: string;
+			onProgress?: (frac: number, label: string) => void;
+		} = {},
+	): Promise<void> {
+		if (!this.ready || this.exporting) return;
+		const entry = this.objects.get(targetId);
+		if (!entry) return;
+		const orig = this.getObjectTransform(targetId);
+		if (!orig) return;
+
+		const axis = opts.axis ?? 'y';
+		const from = opts.from ?? 0;
+		const to = opts.to ?? 90;
+		const step = opts.step ?? 15;
+		const size = opts.size ?? 512;
+		const samples = opts.samples ?? 200;
+		const baseName = opts.baseName ?? 'series';
+		const axisIdx = axis === 'x' ? 0 : axis === 'y' ? 1 : 2;
+		const angles: number[] = [];
+		for (let a = from; a <= to + 1e-6; a += step) angles.push(a);
+
+		this.exporting = true;
+		this.hideDenoise();
+		const logical = this.renderer.getSize(new Vector2());
+		const prevPixelRatio = this.renderer.getPixelRatio();
+		const prevAspect = this.camera.aspect;
+		const prevRenderScale = this.pathTracer.renderScale;
+		const prevEnabled = this.pathTracer.enablePathTracing;
+		const prevPaused = this.pathTracer.pausePathTracing;
+
+		try {
+			this.renderer.setPixelRatio(1);
+			this.renderer.setSize(size, size, false);
+			this.camera.aspect = 1;
+			this.camera.updateProjectionMatrix();
+			this.pathTracer.renderScale = 1;
+			this.pathTracer.enablePathTracing = true;
+			this.pathTracer.pausePathTracing = false;
+
+			for (let i = 0; i < angles.length; i++) {
+				const a = angles[i];
+				const rot: [number, number, number] = [
+					orig.rotation[0],
+					orig.rotation[1],
+					orig.rotation[2],
+				];
+				rot[axisIdx] = orig.rotation[axisIdx] + a;
+				this.setObjectTransform(targetId, { position: orig.position, rotation: rot, scale: orig.scale });
+				// Rebuild the BVH so the path-traced beauty reflects the rotation.
+				this.pathTracer.setScene(this.scene, this.camera);
+				this.pathTracer.updateCamera();
+				this.pathTracer.reset();
+
+				const label = `${axis}+${Math.round(a)}° (${i + 1}/${angles.length})`;
+				while (this.pathTracer.samples < samples && !this.disposed) {
+					this.pathTracer.renderSample();
+					opts.onProgress?.((i + this.pathTracer.samples / samples) / angles.length, label);
+					await new Promise(requestAnimationFrame);
+				}
+				if (this.disposed) return;
+
+				// Snapshot beauty in the same tick, then the position pass.
+				this.pathTracer.renderSample();
+				this.captureCanvas.width = size;
+				this.captureCanvas.height = size;
+				const ctx = this.captureCanvas.getContext('2d', { willReadFrequently: true })!;
+				ctx.drawImage(this.renderer.domElement, 0, 0);
+				const color = ctx.getImageData(0, 0, size, size);
+				const pos = this.capturePositionBuffer(targetId, size, size);
+
+				const tag = `r${axis}${String(Math.round(a)).padStart(3, '0')}`;
+				await this.downloadImageData(color, `${baseName}-${tag}.png`);
+				if (pos) await this.downloadImageData(pos, `${baseName}-${tag}-pos.png`);
+			}
+		} finally {
+			this.setObjectTransform(targetId, orig);
+			this.pathTracer.setScene(this.scene, this.camera);
 			this.renderer.setPixelRatio(prevPixelRatio);
 			this.renderer.setSize(logical.x, logical.y, false);
 			this.camera.aspect = prevAspect;
