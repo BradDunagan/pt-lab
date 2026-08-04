@@ -1,6 +1,6 @@
 <script lang="ts">
 	import { untrack } from 'svelte';
-	import type { LabMaterial } from './pathtracer';
+	import type { LabMaterial, LabTexture } from './pathtracer';
 
 	let {
 		material,
@@ -15,9 +15,10 @@
 	let color = $state(untrack(() => material.color));
 	let shininess = $state(untrack(() => material.shininess));
 	let reflectivity = $state(untrack(() => material.reflectivity));
+	let texture = $state<LabTexture>(untrack(() => material.texture ?? 'none'));
 
 	function emit() {
-		onchange({ color, shininess, reflectivity });
+		onchange({ color, shininess, reflectivity, texture });
 	}
 </script>
 
@@ -47,6 +48,20 @@
 				emit();
 			}}
 		/>
+	</label>
+
+	<label class="tex-row">
+		<span>Texture</span>
+		<select
+			value={texture}
+			onchange={(e) => {
+				texture = e.currentTarget.value as LabTexture;
+				emit();
+			}}
+		>
+			<option value="none">None</option>
+			<option value="cloth">Cloth (plaid)</option>
+		</select>
 	</label>
 
 	<label class="slider">
@@ -90,6 +105,25 @@
 		border-radius: 4px;
 		background: none;
 		cursor: pointer;
+	}
+
+	.tex-row {
+		display: flex;
+		flex-direction: row;
+		align-items: center;
+		justify-content: space-between;
+		font-size: 0.8rem;
+		color: #bbb;
+	}
+
+	.tex-row select {
+		font: inherit;
+		font-size: 0.75rem;
+		padding: 0.15em 0.3em;
+		border: 1px solid #3a3a45;
+		border-radius: 4px;
+		background: #1c1c22;
+		color: #eee;
 	}
 
 	.slider {

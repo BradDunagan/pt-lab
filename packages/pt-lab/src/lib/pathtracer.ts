@@ -2,6 +2,7 @@ import {
 	ACESFilmicToneMapping,
 	Box3,
 	BoxGeometry,
+	CanvasTexture,
 	CircleGeometry,
 	Color,
 	DataTexture,
@@ -18,6 +19,7 @@ import {
 	NoToneMapping,
 	PerspectiveCamera,
 	PlaneGeometry,
+	RepeatWrapping,
 	RGBAFormat,
 	Scene,
 	ShaderMaterial,
@@ -116,10 +118,14 @@ export interface LabTransform {
  * An object's appearance in editor-friendly terms. These map onto PBR
  * material properties: shininess = 1 - roughness, reflectivity = metalness.
  */
+/** Procedural texture options (generated in-app; no asset downloads). */
+export type LabTexture = 'none' | 'cloth';
+
 export interface LabMaterial {
-	color: string; // '#rrggbb' (sRGB)
+	color: string; // '#rrggbb' (sRGB) — tints the texture when one is set
 	shininess: number; // 0 (matte) .. 1 (mirror-sharp)
 	reflectivity: number; // 0 (dielectric) .. 1 (metal)
+	texture?: LabTexture; // absent = 'none'
 }
 
 /** One object's persisted state within a scene. */
@@ -1087,20 +1093,94 @@ export class PathTracerLab {
 			color: `#${m.color.getHexString()}`,
 			shininess: 1 - m.roughness,
 			reflectivity: m.metalness,
+			texture: (m.userData.labTexture as LabTexture | undefined) ?? 'none',
 		};
+	}
+
+	// Lazily-built procedural cloth texture: a woven plaid with contrast at two
+	// scales (thick 25 cm bands + thin 6 cm threads on the 2 m table top), so it
+	// still reads as texture after aggressive downscaling (world-lab's dense
+	// stereo works at ~160 px frames). Per-thread luminance jitter breaks up
+	// uniform runs so windowed matchers (ZNCC) get signal everywhere.
+	private clothTexture: CanvasTexture | null = null;
+
+	private getClothTexture(): CanvasTexture {
+		if (this.clothTexture) return this.clothTexture;
+		const S = 512;
+		const c = document.createElement('canvas');
+		c.width = S;
+		c.height = S;
+		const ctx = c.getContext('2d')!;
+		ctx.fillStyle = '#b4a284';
+		ctx.fillRect(0, 0, S, S);
+		// Deterministic LCG so renders are reproducible across sessions.
+		let seed = 12345;
+		const rand = () => ((seed = (seed * 1103515245 + 12345) & 0x7fffffff) / 0x7fffffff);
+		// Thick plaid bands (64 px ≈ 25 cm on the table top).
+		ctx.fillStyle = 'rgba(122, 62, 48, 0.75)';
+		for (let o = 0; o < S; o += 128) {
+			ctx.fillRect(o, 0, 64, S);
+			ctx.fillRect(0, o, S, 64);
+		}
+		// Thin threads (16 px ≈ 6 cm) with jittered luminance.
+		for (let o = 0; o < S; o += 16) {
+			ctx.fillStyle = `rgba(40, 30, 24, ${0.15 + 0.25 * rand()})`;
+			ctx.fillRect(o, 0, 3, S);
+			ctx.fillStyle = `rgba(245, 240, 225, ${0.1 + 0.2 * rand()})`;
+			ctx.fillRect(0, o + 8, S, 2);
+		}
+		// Aperiodic mottling. A purely periodic weave gives windowed matchers
+		// (ZNCC) multiple cost minima one pattern-period apart — depth estimates
+		// lock onto the wrong lobe (seen as satellite peaks in the depth-error
+		// histogram when grading against ground truth). Random blotches at mixed
+		// scales make every neighborhood unique, so the true match wins.
+		for (let k = 0; k < 400; k++) {
+			const r = 4 + 28 * rand() * rand();
+			const dark = rand() < 0.5;
+			ctx.fillStyle = dark
+				? `rgba(30, 22, 18, ${0.1 + 0.25 * rand()})`
+				: `rgba(250, 244, 228, ${0.1 + 0.22 * rand()})`;
+			ctx.beginPath();
+			ctx.ellipse(S * rand(), S * rand(), r, r * (0.4 + 0.6 * rand()), Math.PI * rand(), 0, Math.PI * 2);
+			ctx.fill();
+		}
+		const tex = new CanvasTexture(c);
+		tex.colorSpace = SRGBColorSpace;
+		tex.wrapS = RepeatWrapping;
+		tex.wrapT = RepeatWrapping;
+		this.clothTexture = tex;
+		return tex;
 	}
 
 	setObjectMaterial(id: string, mat: LabMaterial) {
 		const entry = this.objects.get(id);
 		if (!entry) return;
+		const texture = mat.texture ?? 'none';
 		for (const m of this.materialsOf(entry.object3d)) {
 			m.color.set(mat.color);
 			m.roughness = 1 - mat.shininess;
 			m.metalness = mat.reflectivity;
 			// Scalar/color uniforms update without a shader recompile, so no
 			// needsUpdate. Live in raster; the tracer re-reads on return.
+			const current = (m.userData.labTexture as LabTexture | undefined) ?? 'none';
+			if (current !== texture) {
+				m.map = texture === 'cloth' ? this.getClothTexture() : null;
+				m.userData.labTexture = texture;
+				m.needsUpdate = true; // shader recompile (USE_MAP toggled)
+				// New/removed maps change the tracer's packed texture set —
+				// updateMaterials() isn't enough, force a setScene rebuild.
+				this.objectsDirty = true;
+			}
 		}
 		this.materialsDirty = true;
+		// In edit mode the rebuild happens on return to render (setEditMode).
+		// Applied live in render mode, rebuild now so the tracer repacks maps.
+		if (this.objectsDirty && this.ready && !this.editing && !this.buildingScene) {
+			this.objectsDirty = false;
+			this.materialsDirty = false;
+			this.pathTracer.setScene(this.scene, this.camera);
+			this.lastResetAt = performance.now();
+		}
 	}
 
 	setBounces(bounces: number) {
