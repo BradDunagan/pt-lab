@@ -317,6 +317,34 @@ export class PathTracerLab {
 		`,
 	});
 
+	// Whole-scene depth G-buffer: outputs each fragment's FORWARD depth (camera-
+	// space -z, the same convention world-lab's plane-sweep uses), normalized by
+	// uInvMaxDepth and packed into RGB with the standard fract ladder (24-bit
+	// fixed point, so 8-bit PNG channels reconstruct depth losslessly to
+	// ~maxDepth/2^24). Alpha = coverage (0 where no geometry). Ground truth for
+	// grading Demo 7's dense reconstruction; raster-only, never path traced.
+	private depthMaterial = new ShaderMaterial({
+		uniforms: { uInvMaxDepth: { value: 1 } },
+		vertexShader: /* glsl */ `
+			varying float vViewZ;
+			void main() {
+				vec4 mv = modelViewMatrix * vec4(position, 1.0);
+				vViewZ = -mv.z;
+				gl_Position = projectionMatrix * mv;
+			}
+		`,
+		fragmentShader: /* glsl */ `
+			uniform float uInvMaxDepth;
+			varying float vViewZ;
+			void main() {
+				float d = clamp(vViewZ * uInvMaxDepth, 0.0, 0.999999);
+				vec3 enc = fract(vec3(1.0, 255.0, 65025.0) * d);
+				enc -= enc.yzz * vec3(1.0 / 255.0, 1.0 / 255.0, 0.0);
+				gl_FragColor = vec4(enc, 1.0);
+			}
+		`,
+	});
+
 	constructor(canvas: HTMLCanvasElement, options: LabOptions = {}) {
 		this.onStatus = options.onStatus;
 		this.denoiseCanvas = options.denoiseCanvas;
@@ -1586,6 +1614,97 @@ export class PathTracerLab {
 			this.scene.background = prevBackground;
 			for (const mesh of hidden) mesh.visible = true;
 			rt.dispose();
+		}
+	}
+
+	/**
+	 * Render the WHOLE visible scene with the packed-depth material into an
+	 * off-screen buffer. RGB = forward depth (camera-space -z) normalized by
+	 * maxDepth and packed 24-bit; alpha = coverage. maxDepth is computed from
+	 * the scene bounds as seen from the camera and returned so callers can
+	 * embed it in the filename (decode: depth = unpack(rgb) * maxDepth).
+	 */
+	private captureDepthBuffer(width: number, height: number): { img: ImageData; maxDepth: number } | null {
+		const renderer = this.renderer;
+
+		// Farthest possible forward depth: scene bbox corners in camera space.
+		const box = new Box3();
+		this.scene.traverse((o) => {
+			const mesh = o as Mesh;
+			if (mesh.isMesh && mesh.visible && mesh.geometry) box.expandByObject(mesh);
+		});
+		if (box.isEmpty()) return null;
+		this.camera.updateMatrixWorld();
+		const inv = this.camera.matrixWorldInverse;
+		let maxDepth = 0;
+		for (let c = 0; c < 8; c++) {
+			const corner = new Vector3(
+				c & 1 ? box.max.x : box.min.x,
+				c & 2 ? box.max.y : box.min.y,
+				c & 4 ? box.max.z : box.min.z,
+			).applyMatrix4(inv);
+			if (-corner.z > maxDepth) maxDepth = -corner.z;
+		}
+		if (maxDepth <= 0) return null;
+		maxDepth *= 1.02; // margin so nothing clamps at the packing limit
+		this.depthMaterial.uniforms.uInvMaxDepth.value = 1 / maxDepth;
+
+		const prevToneMapping = renderer.toneMapping;
+		const prevBackground = this.scene.background;
+		const prevAutoClear = renderer.autoClear;
+		const prevClearColor = renderer.getClearColor(new Color());
+		const prevClearAlpha = renderer.getClearAlpha();
+		const prevScissorTest = renderer.getScissorTest();
+
+		const rt = new WebGLRenderTarget(width, height); // 8-bit linear RGBA
+
+		renderer.toneMapping = NoToneMapping;
+		this.scene.background = null;
+		renderer.autoClear = true;
+		renderer.setScissorTest(false);
+		try {
+			this.scene.overrideMaterial = this.depthMaterial;
+			renderer.setClearColor(0x000000, 0); // alpha 0 => no geometry
+			renderer.setRenderTarget(rt);
+			renderer.render(this.scene, this.camera);
+			this.scene.overrideMaterial = null;
+			return { img: this.readTargetPixels(rt, width, height), maxDepth };
+		} finally {
+			this.scene.overrideMaterial = null;
+			renderer.setRenderTarget(null);
+			renderer.setClearColor(prevClearColor, prevClearAlpha);
+			renderer.toneMapping = prevToneMapping;
+			renderer.autoClear = prevAutoClear;
+			renderer.setScissorTest(prevScissorTest);
+			this.scene.background = prevBackground;
+			rt.dispose();
+		}
+	}
+
+	/**
+	 * Export the current view's ground-truth depth pass as a PNG named by the
+	 * camera position, pairing it with a beauty export of the same view:
+	 * `<base>-x<X>-y<Y>-z<Z>-depth<maxDepth>.png` (positions 2dp, matching the
+	 * multi-view filename convention world-lab's Demos 6/7 parse). Raster-only
+	 * and instant — no path tracing involved.
+	 */
+	async exportDepthPass(size: number, baseName = 'view'): Promise<string | null> {
+		if (!this.ready || this.exporting) return null;
+		const prevAspect = this.camera.aspect;
+		try {
+			this.camera.aspect = 1; // square export, like exportPNG
+			this.camera.updateProjectionMatrix();
+			const captured = this.captureDepthBuffer(size, size);
+			if (!captured) return null;
+			const p = this.camera.position;
+			const name =
+				`${baseName}-x${p.x.toFixed(2)}-y${p.y.toFixed(2)}-z${p.z.toFixed(2)}` +
+				`-depth${captured.maxDepth.toFixed(4)}.png`;
+			await this.downloadImageData(captured.img, name);
+			return name;
+		} finally {
+			this.camera.aspect = prevAspect;
+			this.camera.updateProjectionMatrix();
 		}
 	}
 

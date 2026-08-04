@@ -20,6 +20,12 @@
 	import CameraControls from './CameraControls.svelte';
 
 	let lab = $state<PathTracerLab | null>(null);
+	// Dev-only escape hatch so browser automation / console experiments can
+	// drive the lab directly (the camera panel's live inputs need rAF, which
+	// hidden tabs pause).
+	$effect(() => {
+		if (import.meta.env.DEV) (window as unknown as { __ptlab?: PathTracerLab | null }).__ptlab = lab;
+	});
 	let status = $state<LabStatus>({
 		mode: 'loading',
 		samples: 0,
@@ -231,6 +237,18 @@
 		} finally {
 			exporting = false;
 		}
+	}
+
+	// Depth-pass export — ground-truth forward depth of the current view, named
+	// by camera position (pairs with a beauty export of the same view; grades
+	// world-lab Demo 7's dense reconstruction). Raster-only, instant.
+	let depthBase = $state('view');
+	let depthExportMsg = $state('');
+
+	async function saveDepthPass() {
+		if (!lab) return;
+		const name = await lab.exportDepthPass(exportSize, depthBase);
+		depthExportMsg = name ? `Saved ${name}` : 'Depth export failed (empty scene?)';
 	}
 
 	// Rotation-series export — a beauty + object-space-position pair per angle,
@@ -539,6 +557,23 @@
 		<button onclick={savePNG} disabled={!rendering || exporting}>
 			{exporting ? `Rendering… ${Math.round(exportProgress * 100)}%` : 'Save PNG'}
 		</button>
+
+		<details class="series">
+			<summary>Depth-pass export</summary>
+			<p class="hint">
+				Save the current view's ground-truth depth (packed 24-bit PNG, named by camera position +
+				max depth). Pair it with a beauty "Save PNG" of the same view, renamed to
+				<code>{depthBase}-x…-y…-z….png</code>, to grade world-lab's Demo 7 dense mode.
+			</p>
+			<div style="display:grid; grid-template-columns:auto 1fr; gap:0.35rem 0.5rem; align-items:center; margin-bottom:0.5rem;">
+				<span>Name</span>
+				<input type="text" bind:value={depthBase} />
+			</div>
+			<button onclick={saveDepthPass} disabled={!rendering || exporting}>Export depth pass</button>
+			{#if depthExportMsg}
+				<p class="hint">{depthExportMsg}</p>
+			{/if}
+		</details>
 
 		<details class="series">
 			<summary>Rotation-series export</summary>

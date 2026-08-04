@@ -135,6 +135,29 @@ If AI denoise is on, the export is denoised too: it snapshots the color `ImageDa
 Two size subtleties in the denoise path: OIDN pads any input smaller than its tile size (256 for these weights) and the garbage padding bleeds into the image through the UNet's receptive field — wrecking small denoised exports. So when denoising, the scene is rendered and denoised at `max(size, 256)` and then downscaled to the requested size (`DENOISE_MIN_SIZE`). And the aux buffers must be captured with the tile scissor test disabled, or the path tracer's leftover tile clip leaves parts of them at the clear color.
 - **Auxiliary buffers** ("Albedo/normal aux" checkbox, on by default): alongside the noisy color, the denoiser receives two noise-free guide images rendered from the scene — a per-mesh unlit base-color pass (albedo; materials temporarily swapped for `MeshBasicMaterial` mirrors, background white per OIDN convention) and a packed view-space normal pass (`scene.overrideMaterial = MeshNormalMaterial`, background 0x808080 = zero normal). These act as an edge map, so low-sample denoised images keep silhouettes and material boundaries crisp instead of smearing them. Captured once per accumulation cycle into `WebGLRenderTarget`s (albedo target uses an sRGB texture so readback matches the color capture; rows are flipped since GL reads bottom-up), cached until the next reset. Aux and color-only UNets are incompatible, so both are kept and lazily loaded; if aux weights or capture fail, it falls back to color-only with a console warning. Known simplifications: normal maps are lost under the override material, and emissive-only surfaces (the room lamp) get black albedo. Denoising tone-mapped LDR remains off-spec (OIDN prefers linear HDR) but works well in practice.
 
+### Dataset exports (G-buffer ground truth for world-lab)
+
+Beyond the beauty PNG, the demo can export ground-truth passes for grading vision experiments in
+`../world-lab-workspace` — these are raster-only override-material passes (instant, never path
+traced), following the same capture pattern as the denoiser's aux buffers:
+
+- **Rotation-series export** (`exportRotationSeries`): rotates a selected object through an angle
+  range and saves a path-traced beauty + an **object-space-position** pass per angle
+  (`<base>-ryNNN.png` / `-pos.png`). The position pass encodes each fragment's local vertex position
+  normalized to the object bbox — the same surface point keeps the same RGB under any rotation — so
+  it's a correspondence oracle for grading feature matchers (world-lab Demo 8). The matcher itself
+  must only ever see the RGB frames.
+- **Depth-pass export** (`exportDepthPass`): saves the current view's **forward depth** (camera-space
+  −z, the convention world-lab's plane sweep uses) for the whole scene, packed 24-bit into RGB with
+  the standard fract ladder (alpha = coverage), max depth in the filename:
+  `<base>-x<X>-y<Y>-z<Z>-depth<max>.png` (decode `depth = (R/255 + G/65025 + B/16581375) × max`).
+  Position-in-filename matches the multi-view convention Demos 6/7 parse, so a depth pass pairs
+  automatically with a beauty export of the same view and grades Demo 7's dense reconstruction.
+
+In dev builds the demo exposes `window.__ptlab` (the `PathTracerLab` instance) so browser automation
+and console experiments can drive the camera and exports directly — the camera panel's live inputs
+re-render from rAF-driven state, which hidden tabs pause.
+
 ### Other production caveats
 
 - **Material coverage**: `MeshPhysicalMaterial` is the well-supported path (transmission, clearcoat, sheen, iridescence). Custom `ShaderMaterial`s won't translate — the path tracer has its own material model.
