@@ -163,6 +163,94 @@ const EXPORT_SAMPLES = 300;
 // small denoised exports. So denoise at >= this size, then downscale.
 const DENOISE_MIN_SIZE = 256;
 
+// canvas.toBlob() writes an untagged PNG (IHDR/IDAT/IEND only — no color
+// chunks at all), leaving the transfer function and gamut to whatever the
+// reader assumes. The beauty export IS sRGB (the renderer's default output
+// color space plus ACES tone mapping), so it says so explicitly: an sRGB
+// chunk, plus the gAMA/cHRM pair the spec tells you to write alongside it for
+// decoders that predate sRGB awareness. Together they pin both the transfer
+// curve and the primaries, so no reader has to guess. The depth and
+// object-space-position passes stay untagged on purpose: they carry raw
+// linear code values, not color, and any tag would invite a conversion.
+const GAMA_SRGB = 45455; // file gamma 1/2.2 * 100000, per the PNG spec
+// sRGB primaries and the D65 white point, in the spec's 100000ths:
+// white x,y | red x,y | green x,y | blue x,y
+const CHRM_SRGB = [31270, 32900, 64000, 33000, 30000, 60000, 15000, 6000];
+const SRGB_INTENT_PERCEPTUAL = 0; // the intent for a displayed rendering
+
+let crcTable: Uint32Array | null = null;
+function crc32(bytes: Uint8Array): number {
+	if (!crcTable) {
+		crcTable = new Uint32Array(256);
+		for (let n = 0; n < 256; n++) {
+			let c = n;
+			for (let k = 0; k < 8; k++) c = c & 1 ? 0xedb88320 ^ (c >>> 1) : c >>> 1;
+			crcTable[n] = c >>> 0;
+		}
+	}
+	let c = 0xffffffff;
+	for (let i = 0; i < bytes.length; i++) c = crcTable[(c ^ bytes[i]) & 0xff] ^ (c >>> 8);
+	return (c ^ 0xffffffff) >>> 0;
+}
+
+/** Assemble one PNG chunk: length(4) + type(4) + data + crc(4) over type+data. */
+function pngChunk(type: string, data: Uint8Array): Uint8Array<ArrayBuffer> {
+	const chunk = new Uint8Array(12 + data.length);
+	const view = new DataView(chunk.buffer);
+	view.setUint32(0, data.length);
+	for (let i = 0; i < 4; i++) chunk[4 + i] = type.charCodeAt(i);
+	chunk.set(data, 8);
+	view.setUint32(8 + data.length, crc32(chunk.subarray(4, 8 + data.length)));
+	return chunk;
+}
+
+function u32be(values: number[]): Uint8Array<ArrayBuffer> {
+	const out = new Uint8Array(values.length * 4);
+	const view = new DataView(out.buffer);
+	values.forEach((v, i) => view.setUint32(i * 4, Math.round(v)));
+	return out;
+}
+
+/**
+ * Return a copy of `png` declaring its pixels as sRGB — sRGB + gAMA + cHRM,
+ * spliced in after IHDR (all three must precede PLTE and IDAT). Chunks the
+ * encoder already wrote are left alone rather than duplicated, so this is
+ * idempotent; iCCP is honored too, since the spec forbids pairing it with
+ * sRGB. Returns the input untouched if it isn't a PNG we can parse.
+ */
+async function tagSRGB(png: Blob): Promise<Blob> {
+	const bytes = new Uint8Array(await png.arrayBuffer());
+	const SIG = [0x89, 0x50, 0x4e, 0x47, 0x0d, 0x0a, 0x1a, 0x0a];
+	if (bytes.length < 8 + 12 || SIG.some((b, i) => bytes[i] !== b)) return png;
+
+	const view = new DataView(bytes.buffer, bytes.byteOffset, bytes.byteLength);
+	const typeAt = (off: number) =>
+		String.fromCharCode(bytes[off + 4], bytes[off + 5], bytes[off + 6], bytes[off + 7]);
+	if (typeAt(8) !== 'IHDR') return png;
+	const insertAt = 8 + 12 + view.getUint32(8); // past signature + the whole IHDR chunk
+	if (insertAt + 12 > bytes.length) return png;
+
+	// Walk the chunks ahead of the pixel data to see what's already declared.
+	const present = new Set<string>();
+	for (let off = insertAt; off + 12 <= bytes.length; ) {
+		const type = typeAt(off);
+		if (type === 'IDAT' || type === 'PLTE' || type === 'IEND') break;
+		present.add(type);
+		off += 12 + view.getUint32(off);
+	}
+	const managed = present.has('iCCP') || present.has('cICP');
+
+	const additions: BlobPart[] = [];
+	if (!present.has('cHRM') && !managed) additions.push(pngChunk('cHRM', u32be(CHRM_SRGB)));
+	if (!present.has('gAMA') && !managed) additions.push(pngChunk('gAMA', u32be([GAMA_SRGB])));
+	if (!present.has('sRGB') && !managed)
+		additions.push(pngChunk('sRGB', new Uint8Array([SRGB_INTENT_PERCEPTUAL])));
+	if (!additions.length) return png;
+
+	const parts: BlobPart[] = [bytes.subarray(0, insertAt), ...additions, bytes.subarray(insertAt)];
+	return new Blob(parts, { type: 'image/png' });
+}
+
 /** ?scene=procedural | room | room-emissive | room-arealight forces an alternate scene instead of the helmet. */
 function sceneParam(): string | null {
 	return new URLSearchParams(location.search).get('scene');
@@ -1594,19 +1682,8 @@ export class PathTracerLab {
 				octx.imageSmoothingQuality = 'high';
 				octx.drawImage(tmp, 0, 0, size, size);
 			}
-			await new Promise<void>((resolve) => {
-				out.toBlob((blob) => {
-					if (blob) {
-						const url = URL.createObjectURL(blob);
-						const a = document.createElement('a');
-						a.href = url;
-						a.download = filename;
-						a.click();
-						URL.revokeObjectURL(url);
-					}
-					resolve();
-				});
-			});
+			// Beauty export: tone-mapped and sRGB-encoded, so declare it as sRGB.
+			await this.downloadCanvas(out, filename, true);
 		} finally {
 			this.renderer.setPixelRatio(prevPixelRatio);
 			this.renderer.setSize(logical.x, logical.y, false);
@@ -1788,24 +1865,37 @@ export class PathTracerLab {
 		}
 	}
 
-	private async downloadImageData(img: ImageData, filename: string): Promise<void> {
+	/**
+	 * Write ImageData out as a PNG download. `gammaEncoded` declares the pixels
+	 * as sRGB (adds the sRGB/gAMA/cHRM chunks) — true for beauty renders, false
+	 * for the depth/position passes, whose raw linear values aren't color.
+	 */
+	private async downloadImageData(
+		img: ImageData,
+		filename: string,
+		gammaEncoded = false,
+	): Promise<void> {
 		const c = document.createElement('canvas');
 		c.width = img.width;
 		c.height = img.height;
 		c.getContext('2d')!.putImageData(img, 0, 0);
-		await new Promise<void>((resolve) => {
-			c.toBlob((blob) => {
-				if (blob) {
-					const url = URL.createObjectURL(blob);
-					const a = document.createElement('a');
-					a.href = url;
-					a.download = filename;
-					a.click();
-					URL.revokeObjectURL(url);
-				}
-				resolve();
-			});
-		});
+		await this.downloadCanvas(c, filename, gammaEncoded);
+	}
+
+	private async downloadCanvas(
+		c: HTMLCanvasElement,
+		filename: string,
+		gammaEncoded: boolean,
+	): Promise<void> {
+		const blob = await new Promise<Blob | null>((resolve) => c.toBlob(resolve));
+		if (!blob) return;
+		const tagged = gammaEncoded ? await tagSRGB(blob) : blob;
+		const url = URL.createObjectURL(tagged);
+		const a = document.createElement('a');
+		a.href = url;
+		a.download = filename;
+		a.click();
+		URL.revokeObjectURL(url);
 	}
 
 	/**
@@ -1894,7 +1984,7 @@ export class PathTracerLab {
 				const pos = this.capturePositionBuffer(targetId, size, size);
 
 				const tag = `r${axis}${String(Math.round(a)).padStart(3, '0')}`;
-				await this.downloadImageData(color, `${baseName}-${tag}.png`);
+				await this.downloadImageData(color, `${baseName}-${tag}.png`, true);
 				if (pos) await this.downloadImageData(pos, `${baseName}-${tag}-pos.png`);
 			}
 		} finally {
