@@ -268,6 +268,113 @@ function disposeObject(obj: Object3D) {
 	});
 }
 
+
+/* ------------------------------------------------------------------ */
+/* Ground truth                                                        */
+/*                                                                     */
+/* Everything below answers one question for a consumer that measures  */
+/* geometry in the rendered image: WHERE ARE THE EDGES REALLY. The     */
+/* renderer knows, because it has the meshes and the camera; a feature */
+/* detector can only guess. So the scene's own geometry is projected   */
+/* into image space and handed back as plain data.                     */
+/* ------------------------------------------------------------------ */
+
+/** Why a mesh edge shows up in the image at all. */
+export type EdgeCause =
+	/** One adjacent face points at the camera and the other away: this is where
+	 *  the object ends against whatever is behind it. VIEW-DEPENDENT — a smooth
+	 *  sphere has no hard edges and still has a silhouette. */
+	| 'silhouette'
+	/** Two faces meet at an angle sharper than `creaseAngle`. A property of the
+	 *  mesh, not of the view — a cube's twelve edges are always creases. */
+	| 'crease'
+	/** Only one face uses this edge: the mesh is open here (a ground plane's
+	 *  border, a cut-away). */
+	| 'boundary';
+
+/** One ground-truth edge, projected into image space. */
+export interface GroundTruthEdge {
+	id: number;
+	cause: EdgeCause;
+	/** The meshes this edge belongs to, by display name. Usually one; a floor
+	 *  meeting a wall is the case where it is two. */
+	objects: string[];
+	/** Image-space endpoints in pixels, clipped to the frame. */
+	x0: number;
+	y0: number;
+	x1: number;
+	y1: number;
+	/** Camera-space forward depth at each endpoint, in metres. */
+	z0: number;
+	z1: number;
+	/** 2-D length after clipping, in pixels. */
+	length: number;
+	/**
+	 * From +x, anticlockwise, in IMAGE coordinates where y increases DOWNWARD,
+	 * folded to [0, 180). Chosen to match what a detector measuring the same
+	 * edge in the same image would report, so the two are directly comparable.
+	 */
+	angle: number;
+	/** Angle between the two adjacent face normals, degrees. 180 for a boundary. */
+	dihedral: number;
+	/** Fraction of the edge that is neither occluded nor off-frame, 0..1. */
+	visible: number;
+	/** True if the frame cut it: the endpoints are no longer the real ones. */
+	clipped: boolean;
+	/** The vertices it runs between. */
+	v0: number;
+	v1: number;
+}
+
+/** A point where two or more ground-truth edges meet. */
+export interface GroundTruthVertex {
+	id: number;
+	/** Image-space position in pixels. Outside the frame is possible and kept. */
+	x: number;
+	y: number;
+	/** Camera-space forward depth, in metres. */
+	z: number;
+	/** How many ground-truth edges meet here. */
+	degree: number;
+	/** How many of those are at least partly visible. */
+	visibleDegree: number;
+	/** Whether the point lands inside the image at all. A clipped edge keeps
+	 *  its real endpoints, and those are frequently outside. */
+	onFrame: boolean;
+	/** Whether the point survives the depth test. False when off-frame. */
+	visible: boolean;
+	/**
+	 * The widest angle between any two incident edges, as LINES, in [0, 90].
+	 *
+	 * This is what separates a corner from a bend. A silhouette is delivered as
+	 * a polyline, so its interior points are vertices of degree 2 whose edges
+	 * run almost straight through — near 0 here. A cube's vertex is 60-90. Left
+	 * as a number rather than a verdict, because where to cut is the consumer's
+	 * question, not the renderer's.
+	 */
+	angle: number;
+	objects: string[];
+}
+
+/** Ground-truth geometry for one view. */
+export interface GroundTruthView {
+	size: number;
+	camera: {
+		position: [number, number, number];
+		target: [number, number, number];
+		fov: number;
+		aspect: number;
+	};
+	/** What `creaseAngle` the edges were extracted with, in degrees. */
+	creaseAngle: number;
+	/** Depth-pass normalisation, in metres — what a packed depth PNG decodes with. */
+	maxDepth: number;
+	edges: GroundTruthEdge[];
+	vertices: GroundTruthVertex[];
+	/** Meshes whose geometry could not be read, by name. Empty is the good case. */
+	skipped: string[];
+}
+
 export type RoomKind = 'room' | 'room-emissive' | 'room-arealight';
 const ROOM_KINDS = ['room', 'room-emissive', 'room-arealight'];
 
@@ -311,6 +418,221 @@ const FIXTURE_FRACTION = 0.1;
  * intended to port into a larger app: the host UI only talks to its public
  * methods and the onStatus callback, never to three.js internals.
  */
+/* ------------------------------------------------------------------ */
+/* Ground-truth helpers                                                */
+/*                                                                     */
+/* Module scope on purpose: none of this touches renderer state, so it  */
+/* stays testable and readable apart from the class.                    */
+/* ------------------------------------------------------------------ */
+
+/**
+ * Quantum for merging coincident mesh vertices, in metres.
+ *
+ * BoxGeometry is indexed and splits its eight geometric corners into
+ * twenty-four entries so each face can carry its own normal and UVs — the
+ * POSITIONS of those entries are bit-identical, so any quantum merges them.
+ * The value only matters for meshes whose shared corners were authored
+ * separately and drifted; 10 micrometres is far below anything that reaches
+ * a pixel on a metre-scale scene.
+ */
+const GT_QUANTUM = 1e5;
+
+function gtKey(v: Vector3): string {
+	return `${Math.round(v.x * GT_QUANTUM)},${Math.round(v.y * GT_QUANTUM)},${Math.round(v.z * GT_QUANTUM)}`;
+}
+
+interface GtFace {
+	normal: Vector3;
+	centroid: Vector3;
+}
+
+interface GtRawEdge {
+	a: Vector3;
+	b: Vector3;
+	faces: GtFace[];
+	/**
+	 * Every mesh using this edge — usually one, and deliberately not always.
+	 *
+	 * The map is keyed by POSITION across the whole scene, so a floor and the
+	 * wall standing on it share the entry their common edge sits at, and the
+	 * dihedral between them comes out as the 90 degrees it really is. That
+	 * junction is one edge in the image and it belongs to neither mesh alone.
+	 */
+	objects: Set<string>;
+}
+
+/**
+ * Every undirected edge of one mesh, in world space, with the faces using it.
+ *
+ * Keyed by the pair of quantised endpoints, so the two triangles either side
+ * of an edge find each other. An edge with one face is a mesh boundary; with
+ * two, the pair is what decides crease and silhouette.
+ */
+function collectMeshEdges(mesh: Mesh, name: string, into: Map<string, GtRawEdge>): boolean {
+	const geometry = mesh.geometry;
+	const position = geometry?.getAttribute?.('position');
+	if (!position) return false;
+
+	mesh.updateWorldMatrix(true, false);
+	const matrix = mesh.matrixWorld;
+	const index = geometry.getIndex();
+	const triangles = index ? index.count / 3 : position.count / 3;
+	if (!Number.isInteger(triangles)) return false;
+
+	const p = [new Vector3(), new Vector3(), new Vector3()];
+	for (let t = 0; t < triangles; t++) {
+		for (let k = 0; k < 3; k++) {
+			const i = index ? index.getX(t * 3 + k) : t * 3 + k;
+			p[k].fromBufferAttribute(position, i).applyMatrix4(matrix);
+		}
+		const normal = new Vector3()
+			.subVectors(p[1], p[0])
+			.cross(new Vector3().subVectors(p[2], p[0]));
+		// A degenerate triangle has no normal and no edges worth reporting.
+		if (normal.lengthSq() < 1e-24) continue;
+		normal.normalize();
+		const centroid = new Vector3().add(p[0]).add(p[1]).add(p[2]).multiplyScalar(1 / 3);
+
+		for (let k = 0; k < 3; k++) {
+			const a = p[k];
+			const b = p[(k + 1) % 3];
+			const ka = gtKey(a);
+			const kb = gtKey(b);
+			const key = ka < kb ? `${ka}|${kb}` : `${kb}|${ka}`;
+			let edge = into.get(key);
+			if (!edge) {
+				edge = { a: a.clone(), b: b.clone(), faces: [], objects: new Set() };
+				into.set(key, edge);
+			}
+			edge.faces.push({ normal, centroid });
+			edge.objects.add(name);
+		}
+	}
+	return true;
+}
+
+/** Decode one pixel of a packed 24-bit depth pass into metres. */
+function gtDepthAt(data: Uint8ClampedArray, offset: number, maxDepth: number): number {
+	return ((data[offset] + data[offset + 1] / 255 + data[offset + 2] / 65025) / 255) * maxDepth;
+}
+
+/**
+ * Is a point at forward depth `z` unoccluded at this pixel?
+ *
+ * Rasterised visibility, so it is exact to about a pixel and no better. Three
+ * details carry what accuracy there is:
+ *
+ *   - An UNCOVERED pixel counts as visible. The point is geometry and the
+ *     depth pass rasterised nothing there, which happens along a silhouette
+ *     where the edge lies within half a pixel of the boundary. Calling that
+ *     occluded would delete exactly the edges this is built to find.
+ *   - The comparison is against the NEAREST depth in the 3x3, not the centre
+ *     pixel's. At a silhouette the centre pixel may hold either surface
+ *     depending on where the rasteriser landed, and taking the nearer one
+ *     decides the ambiguity conservatively: a hidden edge running close
+ *     behind a silhouette stays hidden.
+	 *   - The tolerance follows the LOCAL SLOPE, taken as the LARGEST step to a
+	 *     neighbour. A surface seen at a grazing angle changes depth enormously
+	 *     between neighbouring pixels, and a fixed tolerance reports every
+	 *     grazing surface as self-occluding. The cost is that within a pixel of
+	 *     a silhouette the tolerance admits almost anything.
+	 *
+	 * That last one looked like a defect and is not. A first run showed 22% of a
+	 * cube's hidden back edge reading as visible, so the slope was replaced with
+	 * a low quantile - robust at a step, and, measured against a view whose
+	 * answer is known, strictly WORSE: two genuinely visible edges fell to 0.42
+	 * and 0.49. A point ON a surface sits up to a pixel of that surface's
+	 * gradient away from whatever the buffer holds, and a tolerance that throws
+	 * the big gradient away cannot cover it. The 22% came from the FIXTURE, not
+	 * the rule: that view was axis-aligned on an axis-aligned cube, so its
+	 * hidden back edges projected exactly onto its visible silhouette edges, and
+	 * no test at any tolerance could have separated them.
+	 *
+	 * Measured on a general view of a cube - nine edges visible, three not:
+	 *
+	 *     max slope x1.5      nine at 1.00,    three at <= 0.04   margin 0.96
+	 *     low quantile x3     nine at >= 0.42, three at <= 0.04   margin 0.38
+	 *     |d - z| <= 1% of z  nine at >= 0.83, three at <= 0.08   margin 0.75
+	 */
+function gtVisibleAt(
+	data: Uint8ClampedArray,
+	size: number,
+	px: number,
+	py: number,
+	z: number,
+	maxDepth: number,
+): boolean {
+	const ix = Math.floor(px);
+	const iy = Math.floor(py);
+	if (ix < 0 || iy < 0 || ix >= size || iy >= size) return false;
+	const centre = (iy * size + ix) * 4;
+	if (data[centre + 3] === 0) return true;
+
+	const d = gtDepthAt(data, centre, maxDepth);
+	let nearest = d;
+	let slope = 0;
+	for (let dy = -1; dy <= 1; dy++) {
+		for (let dx = -1; dx <= 1; dx++) {
+			if (dx === 0 && dy === 0) continue;
+			const nx = ix + dx;
+			const ny = iy + dy;
+			if (nx < 0 || ny < 0 || nx >= size || ny >= size) continue;
+			const o = (ny * size + nx) * 4;
+			if (data[o + 3] === 0) continue;
+			const dn = gtDepthAt(data, o, maxDepth);
+			if (dn < nearest) nearest = dn;
+			const step = Math.abs(dn - d);
+			if (step > slope) slope = step;
+		}
+	}
+	// 2^24 is the packing's resolution; the relative term covers the rest.
+	const tolerance = slope * 1.5 + (3 * maxDepth) / 16777216 + 1e-3 * z;
+	return z <= nearest + tolerance;
+}
+
+/** Clip a 2-D segment to [0,size]^2, Liang-Barsky, in parameter space. */
+function gtClipToFrame(
+	x0: number,
+	y0: number,
+	x1: number,
+	y1: number,
+	size: number,
+): [number, number] | null {
+	const dx = x1 - x0;
+	const dy = y1 - y0;
+	let t0 = 0;
+	let t1 = 1;
+	const edges: [number, number][] = [
+		[-dx, x0 - 0],
+		[dx, size - x0],
+		[-dy, y0 - 0],
+		[dy, size - y0],
+	];
+	for (const [p, q] of edges) {
+		if (p === 0) {
+			if (q < 0) return null; // parallel to this side and outside it
+			continue;
+		}
+		const r = q / p;
+		if (p < 0) {
+			if (r > t1) return null;
+			if (r > t0) t0 = r;
+		} else {
+			if (r < t0) return null;
+			if (r < t1) t1 = r;
+		}
+	}
+	return [t0, t1];
+}
+
+/** Angle between two image-space directions, as LINES, in [0, 90] degrees. */
+function gtLineAngle(ax: number, ay: number, bx: number, by: number): number {
+	const dot = Math.abs(ax * bx + ay * by);
+	const mag = Math.hypot(ax, ay) * Math.hypot(bx, by);
+	if (mag < 1e-12) return 0;
+	return (Math.acos(Math.min(1, dot / mag)) * 180) / Math.PI;
+}
+
 export class PathTracerLab {
 	private renderer: WebGLRenderer;
 	private scene = new Scene();
@@ -495,6 +817,7 @@ export class PathTracerLab {
 			hdrEnv.mapping = EquirectangularReflectionMapping;
 			this.scene.environment = hdrEnv;
 			this.scene.background = hdrEnv;
+			if (!model.name) model.name = 'Model';
 			this.scene.add(model);
 
 			const bounds = new Box3().setFromObject(model);
@@ -506,6 +829,7 @@ export class PathTracerLab {
 				new CircleGeometry(Math.max(size.x, size.z) * 3, 64).rotateX(-Math.PI / 2),
 				new MeshPhysicalMaterial({ color: 0xdedede, roughness: 0.85 }),
 			);
+			floor.name = 'Floor';
 			this.scene.add(floor);
 		}
 
@@ -1499,6 +1823,7 @@ export class PathTracerLab {
 			new PlaneGeometry(ROOM_HALF * 2, ROOM_HALF * 2).rotateX(-Math.PI / 2),
 			new MeshPhysicalMaterial({ color: 0x8c8c8c, roughness: 0.85 }),
 		);
+		floor.name = 'Floor'; // so groundTruthGeometry can attribute its edges
 		this.scene.add(floor);
 
 		// Instantiate the whole library (built-ins + imports), then apply state.
@@ -1859,6 +2184,332 @@ export class PathTracerLab {
 				`-depth${captured.maxDepth.toFixed(4)}.png`;
 			await this.downloadImageData(captured.img, name);
 			return name;
+		} finally {
+			this.camera.aspect = prevAspect;
+			this.camera.updateProjectionMatrix();
+		}
+	}
+
+
+	/**
+	 * Export the auxiliary passes for the current view, alongside a beauty
+	 * render of the same camera.
+	 *
+	 * These are what let a consumer say WHY an edge is in the picture rather
+	 * than only that it is: a depth step is an occlusion, a normal step with no
+	 * depth step is a crease, an albedo step with neither is paint. All three
+	 * are raster passes, so the whole set costs a frame — nothing here path
+	 * traces.
+	 *
+	 * Written UNTAGGED, like `exportDepthPass`: these carry raw linear code
+	 * values, not colour, and an sRGB tag would invite a decoder to apply a
+	 * curve that was never there. A reader must be told `from=linear`.
+	 *
+	 * `maxDepth` is what the depth pass decodes with — `depth = unpack(rgb) *
+	 * maxDepth` — and it is returned rather than only baked into a filename,
+	 * because parsing a float back out of a name is a thing that breaks.
+	 */
+	async exportAOVs(
+		size: number,
+		baseName = 'view',
+		which: { depth?: boolean; normal?: boolean; albedo?: boolean } = {},
+	): Promise<{ files: string[]; maxDepth: number | null }> {
+		if (!this.ready || this.exporting) return { files: [], maxDepth: null };
+		const want = { depth: true, normal: true, albedo: true, ...which };
+		const prevAspect = this.camera.aspect;
+		const files: string[] = [];
+		let maxDepth: number | null = null;
+		try {
+			this.camera.aspect = 1; // square, like exportPNG — the same framing
+			this.camera.updateProjectionMatrix();
+
+			if (want.depth) {
+				const captured = this.captureDepthBuffer(size, size);
+				if (captured) {
+					maxDepth = captured.maxDepth;
+					const name = `${baseName}-depth.png`;
+					await this.downloadImageData(captured.img, name);
+					files.push(name);
+				}
+			}
+			if (want.normal || want.albedo) {
+				const aux = this.captureAuxBuffers(size, size);
+				if (want.normal) {
+					const name = `${baseName}-normal.png`;
+					await this.downloadImageData(aux.normal, name);
+					files.push(name);
+				}
+				if (want.albedo) {
+					const name = `${baseName}-albedo.png`;
+					await this.downloadImageData(aux.albedo, name);
+					files.push(name);
+				}
+			}
+		} finally {
+			this.camera.aspect = prevAspect;
+			this.camera.updateProjectionMatrix();
+		}
+		return { files, maxDepth };
+	}
+
+	/**
+	 * Where the edges of this view REALLY are, as plain data.
+	 *
+	 * A feature detector working from the picture can only propose edges. This
+	 * returns them: every mesh edge that is a silhouette, a crease or a mesh
+	 * boundary, projected into image space, with the fraction of it that is
+	 * actually visible taken from the depth pass. Plus the vertices where those
+	 * edges meet, which is what a corner detector is trying to find.
+	 *
+	 * Three limits, all of them worth stating rather than discovering:
+	 *
+	 *   - **A geometric edge need not be a visible one.** Two faces meeting at
+	 *     a crease under flat lighting produce no gradient at all. Absence of a
+	 *     detection here is not automatically a miss.
+	 *   - **A visible edge need not be geometric.** Texture, shadow boundaries
+	 *     and specular terminators are all real image edges and none of them
+	 *     are in this list. That is what the albedo and normal passes from
+	 *     `exportAOVs` are for.
+	 *   - **Visibility is rasterised**, so it is right to about a pixel. See
+	 *     `gtVisibleAt`.
+	 *
+	 * Returns data, never three.js objects — the same boundary every other
+	 * public method on this class keeps.
+	 */
+	groundTruthGeometry(
+		size: number,
+		opts: { creaseAngle?: number } = {},
+	): GroundTruthView | null {
+		if (!this.ready) return null;
+		const creaseAngle = opts.creaseAngle ?? 20;
+		const prevAspect = this.camera.aspect;
+
+		try {
+			this.camera.aspect = 1;
+			this.camera.updateProjectionMatrix();
+			const captured = this.captureDepthBuffer(size, size);
+			if (!captured) return null;
+			const depth = captured.img.data;
+			const maxDepth = captured.maxDepth;
+
+			this.camera.updateMatrixWorld();
+			const mwi = this.camera.matrixWorldInverse;
+			const projection = this.camera.projectionMatrix;
+			const near = this.camera.near;
+			const eye = this.camera.position.clone();
+
+			/** World point -> camera space. Forward depth is -z. */
+			const toCamera = (p: Vector3) => p.clone().applyMatrix4(mwi);
+			/** Camera space -> pixels. Only valid once z >= near. */
+			const toImage = (c: Vector3) => {
+				const ndc = c.clone().applyMatrix4(projection);
+				return { x: (ndc.x * 0.5 + 0.5) * size, y: (1 - (ndc.y * 0.5 + 0.5)) * size };
+			};
+
+			/* ---- 1. every edge of every visible mesh, in world space ---- */
+
+			const edgeMap = new Map<string, GtRawEdge>();
+			const skipped: string[] = [];
+			const labelFor = (root: Object3D): string => {
+				for (const [, entry] of this.objects) if (entry.object3d === root) return entry.name;
+				if (root === this.roomShell) return 'Room';
+				return root.name || 'Scene';
+			};
+			// A recursive walk rather than scene.traverse: traverse visits hidden
+			// subtrees too, and an object excluded from the scene is hidden at its
+			// ROOT while its meshes still say visible.
+			const walk = (obj: Object3D, name: string) => {
+				if (!obj.visible) return;
+				const mesh = obj as Mesh;
+				if (mesh.isMesh && !collectMeshEdges(mesh, name, edgeMap)) skipped.push(name);
+				for (const child of obj.children) walk(child, name);
+			};
+			for (const root of this.scene.children) walk(root, labelFor(root));
+
+			/* ---- 2. keep the edges that are silhouettes, creases or boundaries ---- */
+
+			interface Kept {
+				edge: GroundTruthEdge;
+				a: Vector3;
+				b: Vector3;
+			}
+			const kept: Kept[] = [];
+			const edges: GroundTruthEdge[] = [];
+
+			for (const raw of edgeMap.values()) {
+				let cause: EdgeCause;
+				let dihedral: number;
+				if (raw.faces.length < 2) {
+					cause = 'boundary';
+					dihedral = 180;
+				} else {
+					const [f0, f1] = raw.faces;
+					dihedral = (Math.acos(Math.min(1, Math.max(-1, f0.normal.dot(f1.normal)))) * 180) / Math.PI;
+					const front0 = f0.normal.dot(f0.centroid.clone().sub(eye)) < 0;
+					const front1 = f1.normal.dot(f1.centroid.clone().sub(eye)) < 0;
+					const silhouette = front0 !== front1;
+					if (!silhouette && dihedral <= creaseAngle) continue;
+					// A cube's silhouette edges are creases too. Silhouette is the
+					// stronger claim about the IMAGE — one side of it is not the
+					// object at all — so it wins the label, and `dihedral` still
+					// says the geometry is sharp there.
+					cause = silhouette ? 'silhouette' : 'crease';
+				}
+
+				const ca = toCamera(raw.a);
+				const cb = toCamera(raw.b);
+				let za = -ca.z;
+				let zb = -cb.z;
+				if (za < near && zb < near) continue;
+				let clipped = false;
+				if (za < near) {
+					ca.lerp(cb, (near - za) / (zb - za));
+					za = near;
+					clipped = true;
+				} else if (zb < near) {
+					cb.lerp(ca, (near - zb) / (za - zb));
+					zb = near;
+					clipped = true;
+				}
+
+				const ia = toImage(ca);
+				const ib = toImage(cb);
+				const span = gtClipToFrame(ia.x, ia.y, ib.x, ib.y, size);
+				if (!span) continue; // entirely off-frame
+				const [t0, t1] = span;
+				if (t0 > 0 || t1 < 1) clipped = true;
+
+				const x0 = ia.x + (ib.x - ia.x) * t0;
+				const y0 = ia.y + (ib.y - ia.y) * t0;
+				const x1 = ia.x + (ib.x - ia.x) * t1;
+				const y1 = ia.y + (ib.y - ia.y) * t1;
+				// Depth is linear in INVERSE depth across the image, not in depth,
+				// so interpolating z directly would be wrong by the perspective.
+				const zAt = (t: number) => 1 / ((1 - t) / za + t / zb);
+
+				const length = Math.hypot(x1 - x0, y1 - y0);
+				const samples = Math.min(512, Math.max(8, Math.ceil(length) + 1));
+				let seen = 0;
+				for (let s = 0; s < samples; s++) {
+					const u = s / (samples - 1);
+					const t = t0 + (t1 - t0) * u;
+					if (gtVisibleAt(depth, size, x0 + (x1 - x0) * u, y0 + (y1 - y0) * u, zAt(t), maxDepth)) {
+						seen++;
+					}
+				}
+
+				let angle = (Math.atan2(y1 - y0, x1 - x0) * 180) / Math.PI;
+				angle = ((angle % 180) + 180) % 180;
+
+				const edge: GroundTruthEdge = {
+					id: edges.length + 1,
+					cause,
+					objects: [...raw.objects].sort(),
+					x0, y0, x1, y1,
+					z0: zAt(t0),
+					z1: zAt(t1),
+					length,
+					angle,
+					dihedral,
+					visible: seen / samples,
+					clipped,
+					v0: 0,
+					v1: 0,
+				};
+				edges.push(edge);
+				kept.push({ edge, a: raw.a, b: raw.b });
+			}
+
+			/* ---- 3. the vertices those edges meet at ---- */
+
+			interface RawVertex {
+				p: Vector3;
+				incident: { edge: GroundTruthEdge; other: Vector3 }[];
+				objects: Set<string>;
+			}
+			const vertexMap = new Map<string, RawVertex>();
+			const register = (p: Vector3, other: Vector3, k: Kept) => {
+				const key = gtKey(p);
+				let v = vertexMap.get(key);
+				if (!v) {
+					v = { p: p.clone(), incident: [], objects: new Set() };
+					vertexMap.set(key, v);
+				}
+				v.incident.push({ edge: k.edge, other });
+				for (const name of k.edge.objects) v.objects.add(name);
+			};
+			for (const k of kept) {
+				register(k.a, k.b, k);
+				register(k.b, k.a, k);
+			}
+
+			const vertices: GroundTruthVertex[] = [];
+			for (const raw of vertexMap.values()) {
+				const cv = toCamera(raw.p);
+				const z = -cv.z;
+				if (z < near) continue; // behind the camera: no image position to report
+				const here = toImage(cv);
+
+				// Direction of each incident edge as it LEAVES this vertex, in the
+				// image. Near-clipped so a far endpoint behind the camera still
+				// gives a usable direction.
+				const directions: [number, number][] = [];
+				for (const inc of raw.incident) {
+					const co = toCamera(inc.other);
+					let zo = -co.z;
+					if (zo < near) {
+						co.lerp(cv, (near - zo) / (z - zo));
+						zo = near;
+					}
+					const there = toImage(co);
+					const dx = there.x - here.x;
+					const dy = there.y - here.y;
+					if (Math.hypot(dx, dy) > 1e-9) directions.push([dx, dy]);
+				}
+				let widest = 0;
+				for (let i = 0; i < directions.length; i++) {
+					for (let j = i + 1; j < directions.length; j++) {
+						const a = gtLineAngle(directions[i][0], directions[i][1], directions[j][0], directions[j][1]);
+						if (a > widest) widest = a;
+					}
+				}
+
+				const onFrame = here.x >= 0 && here.y >= 0 && here.x < size && here.y < size;
+				const id = vertices.length + 1;
+				for (const inc of raw.incident) {
+					// An edge runs between two vertices; whichever end this is, take
+					// the slot still unfilled.
+					if (inc.edge.v0 === 0) inc.edge.v0 = id;
+					else inc.edge.v1 = id;
+				}
+				vertices.push({
+					id,
+					x: here.x,
+					y: here.y,
+					z,
+					degree: raw.incident.length,
+					visibleDegree: raw.incident.filter((i) => i.edge.visible > 0).length,
+					onFrame,
+					visible: onFrame && gtVisibleAt(depth, size, here.x, here.y, z, maxDepth),
+					angle: widest,
+					objects: [...raw.objects].sort(),
+				});
+			}
+
+			return {
+				size,
+				camera: {
+					position: this.camera.position.toArray() as [number, number, number],
+					target: this.controls.target.toArray() as [number, number, number],
+					fov: this.camera.fov,
+					aspect: 1,
+				},
+				creaseAngle,
+				maxDepth,
+				edges,
+				vertices,
+				skipped: [...new Set(skipped)],
+			};
 		} finally {
 			this.camera.aspect = prevAspect;
 			this.camera.updateProjectionMatrix();

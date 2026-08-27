@@ -160,6 +160,32 @@ traced), following the same capture pattern as the denoiser's aux buffers:
   Position-in-filename matches the multi-view convention Demos 6/7 parse, so a depth pass pairs
   automatically with a beauty export of the same view and grades Demo 7's dense reconstruction.
 
+- **AOV set** (`exportAOVs`): saves depth, normal and albedo for the current view in one call —
+  `<base>-depth.png`, `-normal.png`, `-albedo.png` — and **returns** `maxDepth` alongside the file
+  names rather than only baking it into one, because parsing a float back out of a filename is a
+  thing that breaks. Same passes, same encodings and same untagged policy as the two above; the
+  normal and albedo captures are the denoiser's own aux buffers, reused. The set decomposes *why*
+  an edge is in a picture: a depth step is an occlusion, a normal step with no depth step is a
+  crease, an albedo step with neither is texture, and an edge with none of the three belongs to the
+  lighting rather than to the object.
+- **Projected geometry** (`groundTruthGeometry`): returns — as plain data, never three.js objects —
+  every mesh edge that is a **silhouette**, a **crease** or a mesh **boundary**, projected into
+  image space, with the fraction of it that is actually visible measured against the depth pass,
+  plus the vertices those edges meet at. This is the pass that answers "is the corner a detector
+  reported a real one", which no raster pass can: a corner is a *point*, and extracting points from
+  an edge image is itself the problem under test.
+
+  Three limits are worth stating rather than discovering. A **geometric edge need not be a visible
+  one** — two faces meeting under flat lighting produce no gradient. A **visible edge need not be
+  geometric** — shadow boundaries and specular terminators are real image edges and are not here.
+  And **visibility is rasterised**, so it is right to about a pixel; `gtVisibleAt` documents the
+  tolerance and the measurement behind it. `creaseAngle` matters: at 1° a smooth sphere yields every
+  one of its facet boundaries, at 20° it correctly yields none and keeps only its silhouette.
+
+  Edges are keyed by position across the whole scene rather than per mesh, so a floor and the wall
+  standing on it share the entry their common edge sits at and the dihedral between them comes out
+  as the 90° it really is.
+
 In dev builds the demo exposes `window.__ptlab` (the `PathTracerLab` instance) so browser automation
 and console experiments can drive the camera and exports directly — the camera panel's live inputs
 re-render from rAF-driven state, which hidden tabs pause.
