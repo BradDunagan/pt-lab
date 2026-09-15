@@ -13,6 +13,22 @@ This is an npm-workspaces monorepo:
 | `packages/pt-lab/` | **The library** — the consumable module (`PathTracerLab` + Svelte components + scene/library persistence). |
 | `packages/demo/` | A demo app that consumes `pt-lab` and provides the demo assets (model, HDR, denoiser weights). |
 
+## Node version
+
+The toolchain needs a recent Node: `vite@8` requires `^20.19.0 || >=22.12.0`, and `@sveltejs/vite-plugin-svelte@7` requires `^20.19 || ^22.12 || >=24`. Node 18 won't work. The repo pins **24.11.0** in `.nvmrc`, the same version `../paneless-workspace` pins.
+
+With [nvm](https://github.com/nvm-sh/nvm), from the repo root:
+
+```sh
+nvm install   # installs the version in .nvmrc if you don't have it
+nvm use       # switches to it
+npm install   # reinstall so any native dependencies rebuild for the new Node
+```
+
+To change the pinned version, edit `.nvmrc`. It's a one-line text file holding the version number.
+
+To make `nvm use` happen automatically when you `cd` into the repo, add nvm's `load-nvmrc` hook to your `~/.zshrc`. It's in the nvm README under [Deeper Shell Integration → zsh](https://github.com/nvm-sh/nvm#zsh).
+
 ## Develop
 
 ```sh
