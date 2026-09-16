@@ -197,14 +197,19 @@
 	});
 
 	const selectedName = $derived(objects.find((o) => o.id === selectedId)?.name ?? '');
-	// Recomputes only when the selection (or lab) changes — exactly when the
-	// TransformPanel should re-seed. Edits after that flow one-way to the lab.
-	const selectedTransform = $derived(
-		selectedId && lab ? lab.getObjectTransform(selectedId) : null,
-	);
-	const selectedMaterial = $derived(
-		selectedId && lab ? lab.getObjectMaterial(selectedId) : null,
-	);
+	// Recomputes when the selection changes or edit mode is re-entered — exactly
+	// when these panels mount and re-seed (they exist only in edit mode). Reading
+	// editMode matters: without it a panel remounted on re-entering edit mode
+	// would seed from the values at selection time, and its next edit would
+	// overwrite everything changed since. Edits flow one-way to the lab.
+	const selectedTransform = $derived.by(() => {
+		void editMode;
+		return selectedId && lab ? lab.getObjectTransform(selectedId) : null;
+	});
+	const selectedMaterial = $derived.by(() => {
+		void editMode;
+		return selectedId && lab ? lab.getObjectMaterial(selectedId) : null;
+	});
 	// Read from the live list (not a one-time getLight), so when the LightPanel
 	// remounts — e.g. on re-entering Edit mode — it seeds from current values
 	// rather than those at selection time. The keyed panel ignores prop updates
