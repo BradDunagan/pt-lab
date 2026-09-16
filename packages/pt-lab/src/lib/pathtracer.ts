@@ -1,5 +1,6 @@
 import {
 	ACESFilmicToneMapping,
+	AmbientLight,
 	Box3,
 	BoxGeometry,
 	CanvasTexture,
@@ -17,6 +18,7 @@ import {
 	MeshPhysicalMaterial,
 	MeshStandardMaterial,
 	NoToneMapping,
+	PCFSoftShadowMap,
 	PerspectiveCamera,
 	PlaneGeometry,
 	PointLight,
@@ -318,6 +320,30 @@ function disposeObject(obj: Object3D) {
 	});
 }
 
+/** Meshes under `obj` take part in the edit-mode shadow maps. */
+function setShadowFlags(obj: Object3D, cast: boolean, receive: boolean) {
+	obj.traverse((child) => {
+		const mesh = child as Mesh;
+		if (!mesh.isMesh) return;
+		mesh.castShadow = cast;
+		mesh.receiveShadow = receive;
+	});
+}
+
+/** A SpotLight standing in for a lamp that cannot cast a shadow map itself. */
+function makeProxyLight(): SpotLight {
+	const proxy = new SpotLight(0xffffff, 0, 0, PROXY_ANGLE, PROXY_PENUMBRA);
+	proxy.castShadow = true;
+	proxy.visible = false;
+	// The wide cone spreads the map over a large frustum — 2k keeps it crisp.
+	proxy.shadow.mapSize.set(2048, 2048);
+	proxy.shadow.camera.near = 0.1;
+	proxy.shadow.camera.far = 2 * ROOM_CEIL;
+	proxy.shadow.bias = -0.0005;
+	proxy.shadow.normalBias = 0.02;
+	return proxy;
+}
+
 /** Copy light data so callers never share the lab's position tuple. */
 function copyLight(l: LabLight): LabLight {
 	return { name: l.name, type: l.type, color: l.color, intensity: l.intensity, position: [...l.position] };
@@ -473,6 +499,32 @@ const FIXTURE_FRACTION = 0.1;
 const AREA_LIGHT_SIZE = 0.5;
 const NEW_LIGHT_POSITION: [number, number, number] = [0, 2.2, 0];
 const LIGHT_MARKER_RADIUS = 0.04;
+
+// Edit-mode shadows. three.js shadow maps need a light that supports them,
+// and a RectAreaLight does not ("There is no shadow support"), nor does the
+// emissive room's lamp, which is a mesh. So every area-ish lamp gets a
+// SpotLight proxy that stands in for it in the raster preview: it carries the
+// lamp's output as candela (radiance × area) and casts the shadow, while the
+// lamp itself is hidden. Swapped back on return to Render, where the path
+// tracer does the real thing. Wide cone + penumbra to approximate an area
+// light's soft edge.
+// A wide cone so the proxy also reaches the walls the lamp used to light —
+// nearly a point light, but a spot, because only spot/point/directional cast
+// shadow maps and a spot needs one shadow pass where a point needs six.
+const PROXY_ANGLE = (70 * Math.PI) / 180;
+const PROXY_PENUMBRA = 0.5;
+// How much of an area lamp's output moves to its proxy while editing. The
+// remainder stays on the area light, which lights the walls the narrow proxy
+// cone misses and fills its shadows — raster has no bounce light, so a lamp
+// entirely on the proxy would leave pitch-black shadows and dark walls.
+const PROXY_SHARE = 0.6;
+// Raster has no bounce light, so shadow-map shadows go pure black where the
+// path tracer would fill them with several bounces off the walls. A dim
+// ambient stands in for that, scaled to the lamp. Edit mode only, and the
+// tracer never sees it: it collects rect/spot/point/directional lights only.
+const AMBIENT_FILL = 0.35;
+const PATCH_AREA = PATCH_HALF_X * 2 * PATCH_HALF_Z * 2;
+const AREA_LIGHT_AREA = AREA_LIGHT_SIZE * AREA_LIGHT_SIZE;
 
 /**
  * Framework-agnostic wrapper around WebGLPathTracer. This class is the piece
@@ -712,6 +764,13 @@ export class PathTracerLab {
 	private exporting = false;
 	private patchMat: MeshPhysicalMaterial | null = null;
 	private rectLight: RectAreaLight | null = null;
+	// Stands in for the room's ceiling lamp in the raster views (both geometric
+	// rooms; the baked-env room has no lamp object to stand in for).
+	private roomProxy: SpotLight | null = null;
+	// Stands in for bounce light in the raster views (geometric rooms).
+	private ambientFill: AmbientLight | null = null;
+	// Shadow maps are re-rendered only when the scene changed (autoUpdate off).
+	private shadowsDirty = true;
 	// Current room and its swappable pieces (shell geometry or baked env map).
 	private roomKind: RoomKind | null = null;
 	private roomShell: Object3D | null = null;
@@ -743,7 +802,10 @@ export class PathTracerLab {
 	// group in the scene; each has a marker sphere in markerScene, which only the
 	// Edit-mode raster pass draws, so markers never reach the tracer's BVH or
 	// the ground-truth passes.
-	private lights = new Map<string, { light: Light; marker: Mesh; data: LabLight }>();
+	private lights = new Map<
+		string,
+		{ light: Light; proxy: SpotLight | null; marker: Mesh; data: LabLight }
+	>();
 	private lightCounter = 0;
 	private lightsGroup: Group | null = null;
 	private markerScene = new Scene();
@@ -846,6 +908,12 @@ export class PathTracerLab {
 		this.renderer = new WebGLRenderer({ canvas, antialias: true });
 		this.renderer.setPixelRatio(Math.min(window.devicePixelRatio, 2));
 		this.renderer.toneMapping = ACESFilmicToneMapping;
+		// Shadow maps for the raster views (Edit mode, and the tracer's own
+		// interaction frames). The scene is static between edits, so they are
+		// re-rendered on demand rather than every frame — see shadowsDirty.
+		this.renderer.shadowMap.enabled = true;
+		this.renderer.shadowMap.type = PCFSoftShadowMap;
+		this.renderer.shadowMap.autoUpdate = false;
 
 		this.camera = new PerspectiveCamera(50, 1, 0.05, 100);
 		this.camera.position.set(2.2, 1.3, 2.6);
@@ -892,6 +960,7 @@ export class PathTracerLab {
 			this.scene.environment = hdrEnv;
 			this.scene.background = hdrEnv;
 			if (!model.name) model.name = 'Model';
+			setShadowFlags(model, true, true);
 			this.scene.add(model);
 
 			const bounds = new Box3().setFromObject(model);
@@ -904,6 +973,7 @@ export class PathTracerLab {
 				new MeshPhysicalMaterial({ color: 0xdedede, roughness: 0.85 }),
 			);
 			floor.name = 'Floor';
+			floor.receiveShadow = true;
 			this.scene.add(floor);
 		}
 
@@ -1092,6 +1162,17 @@ export class PathTracerLab {
 			group.add(this.rectLight);
 		}
 
+		// Shadow-casting stand-in for the lamp, whichever kind it is. Just below
+		// the fixture quad, so the quad is behind it and never shadows the room.
+		this.roomProxy = makeProxyLight();
+		this.roomProxy.position.set(0, ROOM_CEIL - 0.02, 0);
+		this.roomProxy.color.set(0xfffdf8);
+		group.add(this.roomProxy);
+
+		this.ambientFill = new AmbientLight(0xfffdf8, 0);
+		this.ambientFill.visible = false;
+		group.add(this.ambientFill);
+
 		// The visible fixture: carries the full lamp output in emissive mode,
 		// or a small cosmetic share of it alongside the invisible RectAreaLight.
 		this.patchMat = new MeshPhysicalMaterial({
@@ -1105,6 +1186,10 @@ export class PathTracerLab {
 		);
 		patch.position.y = ROOM_CEIL - 0.005;
 		group.add(patch);
+
+		// Room surfaces only receive: walls casting into the lamp's wide cone
+		// would band the floor at the edges, and the fixture must never cast.
+		setShadowFlags(group, false, true);
 
 		return group;
 	}
@@ -1173,6 +1258,14 @@ export class PathTracerLab {
 
 		// During a fixed-size export, exportPNG() drives rendering itself.
 		if (this.exporting) return;
+
+		// Shadow maps are static between edits (autoUpdate is off): re-render
+		// them on the first frame after anything moved, in either mode — the
+		// tracer's interaction frames are rasterized too.
+		if (this.shadowsDirty) {
+			this.shadowsDirty = false;
+			this.renderer.shadowMap.needsUpdate = true;
+		}
 
 		if (this.editing) {
 			// Scene Editor: a plain, fast raster pass — no path tracing. This is
@@ -1486,6 +1579,12 @@ export class PathTracerLab {
 	setEditMode(edit: boolean) {
 		if (this.editing === edit) return;
 		this.editing = edit;
+		// Hand each area lamp's shadow share to its proxy (and take it back).
+		// Visibility decides which lights the tracer collects, so this must
+		// happen before the sync below.
+		this.syncRasterLights();
+		this.lightsDirty = true;
+		this.shadowsDirty = true;
 		if (edit) {
 			this.hideDenoise();
 		} else if (this.ready) {
@@ -1514,6 +1613,7 @@ export class PathTracerLab {
 	}
 
 	private registerObject(object3d: Object3D, name: string, key: string = name) {
+		setShadowFlags(object3d, true, true);
 		const id = `obj-${++this.objectCounter}`;
 		this.objects.set(id, { object3d, name, key, included: object3d.visible });
 	}
@@ -1533,6 +1633,7 @@ export class PathTracerLab {
 		entry.included = included;
 		entry.object3d.visible = included; // instant in the raster edit view
 		this.objectsDirty = true;
+		this.shadowsDirty = true;
 		this.emitObjects();
 	}
 
@@ -1564,6 +1665,7 @@ export class PathTracerLab {
 		o.scale.set(t.scale[0], t.scale[1], t.scale[2]);
 		// Live in the raster view; the traced BVH refits on return to render.
 		this.objectsDirty = true;
+		this.shadowsDirty = true;
 	}
 
 	/** Every standard/physical material under an object (deduped). */
@@ -1711,10 +1813,11 @@ export class PathTracerLab {
 		if (!entry) return;
 		if (entry.data.type !== data.type) {
 			// Each type is a different three.js class — swap the object, keep the id.
-			entry.light.removeFromParent();
-			entry.light.dispose();
-			entry.light = this.makeLight(data.type);
-			this.ensureLightsGroup().add(entry.light);
+			this.disposeLightObjects(entry);
+			const made = this.makeLight(data.type);
+			entry.light = made.light;
+			entry.proxy = made.proxy;
+			this.addLightObjects(entry);
 		}
 		entry.data = copyLight(data);
 		this.applyLightData(entry);
@@ -1742,37 +1845,78 @@ export class PathTracerLab {
 	/** Build a light and its marker from data. Scene-graph only — no tracer sync. */
 	private createLight(data: LabLight): string {
 		const id = `light-${++this.lightCounter}`;
+		const made = this.makeLight(data.type);
 		const entry = {
-			light: this.makeLight(data.type),
+			...made,
 			marker: new Mesh(
 				new SphereGeometry(LIGHT_MARKER_RADIUS, 16, 8),
 				new MeshBasicMaterial(),
 			),
 			data: copyLight(data),
 		};
-		this.ensureLightsGroup().add(entry.light);
+		this.addLightObjects(entry);
 		this.markerScene.add(entry.marker);
-		this.applyLightData(entry);
+		// Registered before applying: syncRasterLights walks the map, so a light
+		// added while editing would otherwise keep a dark, hidden proxy.
 		this.lights.set(id, entry);
+		this.applyLightData(entry);
 		return id;
 	}
 
-	private makeLight(type: LabLightType): Light {
+	/** The light, plus a shadow-casting proxy for the kinds that need one. */
+	private makeLight(type: LabLightType): { light: Light; proxy: SpotLight | null } {
 		switch (type) {
-			case 'spot':
+			case 'spot': {
 				// 45° cone with a soft edge. Its default target sits at the origin.
-				return new SpotLight(0xffffff, 1, 0, Math.PI / 4, 0.2);
+				const spot = new SpotLight(0xffffff, 1, 0, Math.PI / 4, 0.2);
+				this.enableShadow(spot);
+				return { light: spot, proxy: null };
+			}
 			case 'area':
 				// LTC lookup tables for the rasterized preview frames.
 				RectAreaLightUniformsLib.init();
-				return new RectAreaLight(0xffffff, 1, AREA_LIGHT_SIZE, AREA_LIGHT_SIZE);
-			default:
-				return new PointLight();
+				return {
+					light: new RectAreaLight(0xffffff, 1, AREA_LIGHT_SIZE, AREA_LIGHT_SIZE),
+					proxy: makeProxyLight(),
+				};
+			default: {
+				const point = new PointLight();
+				this.enableShadow(point);
+				return { light: point, proxy: null };
+			}
 		}
 	}
 
-	private applyLightData(entry: { light: Light; marker: Mesh; data: LabLight }) {
-		const { light, marker, data } = entry;
+	/** Shadow settings for a light that casts its own (point/spot). */
+	private enableShadow(light: PointLight | SpotLight) {
+		light.castShadow = true;
+		light.shadow.mapSize.set(1024, 1024);
+		light.shadow.camera.near = 0.1;
+		light.shadow.camera.far = 2 * ROOM_CEIL;
+		light.shadow.bias = -0.0005;
+		light.shadow.normalBias = 0.02;
+	}
+
+	private addLightObjects(entry: { light: Light; proxy: SpotLight | null }) {
+		const group = this.ensureLightsGroup();
+		group.add(entry.light);
+		if (entry.proxy) group.add(entry.proxy);
+	}
+
+	private disposeLightObjects(entry: { light: Light; proxy: SpotLight | null }) {
+		entry.light.removeFromParent();
+		entry.light.dispose();
+		entry.proxy?.removeFromParent();
+		entry.proxy?.dispose();
+	}
+
+	private applyLightData(entry: {
+		light: Light;
+		proxy: SpotLight | null;
+		marker: Mesh;
+		data: LabLight;
+	}) {
+		const { light, proxy, marker, data } = entry;
 		light.name = data.name;
 		light.color.set(data.color);
 		light.intensity = data.intensity;
@@ -1782,8 +1926,35 @@ export class PathTracerLab {
 		// The tracer packs lights from matrixWorld, which may not have been
 		// refreshed by a render yet when it syncs immediately (render mode).
 		light.updateMatrixWorld();
+		if (proxy) {
+			proxy.position.copy(light.position);
+			proxy.color.set(data.color);
+			proxy.updateMatrixWorld();
+		}
 		marker.position.set(...data.position);
 		(marker.material as MeshBasicMaterial).color.set(data.color);
+		this.syncRasterLights();
+		this.shadowsDirty = true;
+	}
+
+	/**
+	 * Move each area lamp's shadow-casting share to its proxy while editing,
+	 * and give it all back on return to Render. The proxy is hidden there,
+	 * which also keeps it out of the tracer (it collects only visible lights).
+	 */
+	private syncRasterLights() {
+		const edit = this.editing;
+		for (const { light, proxy, data } of this.lights.values()) {
+			if (!proxy) continue;
+			proxy.visible = edit;
+			light.intensity = data.intensity * (edit ? 1 - PROXY_SHARE : 1);
+			// Radiance (nits) over the emitting area ≈ the spot's candela.
+			proxy.intensity = data.intensity * AREA_LIGHT_AREA * PROXY_SHARE;
+		}
+		if (this.roomProxy) this.roomProxy.visible = edit;
+		if (this.ambientFill) this.ambientFill.visible = edit;
+		// Re-splits the room lamp between its real light and its proxy.
+		this.setEnvironmentIntensity(this.envIntensity);
 	}
 
 	private ensureLightsGroup(): Group {
@@ -1795,11 +1966,11 @@ export class PathTracerLab {
 		return this.lightsGroup;
 	}
 
-	private disposeLight(entry: { light: Light; marker: Mesh }) {
-		entry.light.removeFromParent();
-		entry.light.dispose();
+	private disposeLight(entry: { light: Light; proxy: SpotLight | null; marker: Mesh }) {
+		this.disposeLightObjects(entry);
 		this.markerScene.remove(entry.marker);
 		disposeObject(entry.marker);
+		this.shadowsDirty = true;
 	}
 
 	/** Light changes reach the tracer now in render mode, or on return from Edit. */
@@ -1839,8 +2010,17 @@ export class PathTracerLab {
 			this.patchMat.emissiveIntensity = this.rectLight
 				? radiance * FIXTURE_FRACTION
 				: radiance;
+			// While editing, the proxy carries the shadow-casting share of the
+			// lamp — all of it in the emissive room, where the lamp is a mesh
+			// that lights the raster preview not at all.
+			if (this.roomProxy) {
+				this.roomProxy.intensity =
+					radiance * PATCH_AREA * (this.rectLight ? PROXY_SHARE : 1);
+			}
+			if (this.ambientFill) this.ambientFill.intensity = intensity * AMBIENT_FILL;
 			if (this.rectLight) {
-				this.rectLight.intensity = radiance * (1 - FIXTURE_FRACTION);
+				this.rectLight.intensity =
+					radiance * (1 - FIXTURE_FRACTION) * (this.editing ? 1 - PROXY_SHARE : 1);
 				if (syncTracer) this.pathTracer.updateLights();
 			}
 			if (syncTracer) this.pathTracer.updateMaterials();
@@ -1888,6 +2068,9 @@ export class PathTracerLab {
 		this.scene.background = null;
 		this.patchMat = null;
 		this.rectLight = null;
+		this.roomProxy = null;
+		this.ambientFill = null;
+		this.shadowsDirty = true;
 
 		if (kind === 'room') {
 			const tex = this.makeRoomEnvironment();
@@ -1901,8 +2084,9 @@ export class PathTracerLab {
 		}
 
 		this.roomKind = kind;
-		// Re-apply the current light intensity to the freshly built room.
-		this.setEnvironmentIntensity(this.envIntensity);
+		// Re-applies the current light intensity to the freshly built room,
+		// split for the current mode.
+		this.syncRasterLights();
 	}
 
 	/** Capture the current editor scene as saveable data. */
@@ -2048,6 +2232,7 @@ export class PathTracerLab {
 			new MeshPhysicalMaterial({ color: 0x8c8c8c, roughness: 0.85 }),
 		);
 		floor.name = 'Floor'; // so groundTruthGeometry can attribute its edges
+		floor.receiveShadow = true;
 		this.scene.add(floor);
 
 		// Instantiate the whole library (built-ins + imports), then apply state.
@@ -2071,6 +2256,7 @@ export class PathTracerLab {
 		}
 		this.camera.updateProjectionMatrix();
 		this.controls.update();
+		this.shadowsDirty = true;
 		this.buildingScene = false;
 	}
 

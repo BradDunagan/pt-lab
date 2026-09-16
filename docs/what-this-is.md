@@ -48,7 +48,19 @@ The room trio is a deliberate ladder — baked environment vs. emissive geometry
 The **Edit Scene / Return to Render** button toggles between two modes:
 
 - **Render** — the path-traced Live Scene described above (plus AI denoising).
-- **Edit** — a fast **raster** preview (`renderer.render(scene, camera)` each frame, no accumulation) for composing a scene. Edits show instantly; the traced BVH only rebuilds when you return to Render. Raster fidelity varies by room — reflections need a `scene.environment` or direct light, so the emissive room looks dark in Edit and is best judged in Render.
+- **Edit** — a fast **raster** preview (`renderer.render(scene, camera)` each frame, no accumulation) for composing a scene. Edits show instantly; the traced BVH only rebuilds when you return to Render. Raster fidelity is approximate — reflections need a `scene.environment` or direct light, and shadows are shadow maps (see below) rather than traced — so final quality is still judged in Render.
+
+#### Edit-mode shadows
+
+Raster shadow maps make placement readable — you can see what sits on what. three.js only casts them from point, spot, and directional lights, and a `RectAreaLight` explicitly has none (nor does the emissive room's lamp, which is a mesh). So each area-ish lamp gets a hidden **`SpotLight` proxy** that stands in for it while editing:
+
+- The proxy takes 60% of the lamp's output (all of it in the emissive room, where the lamp contributes nothing to raster) and casts the shadow; the real lamp keeps the rest as fill, so shadows aren't pitch black and the walls stay lit. The proxy is wide-coned (70°, soft penumbra) to approximate an area light.
+- Editor **point** and **spot** lights cast their own shadow maps directly — no proxy.
+- A dim **ambient fill** stands in for the bounce light that raster lacks but the path tracer computes.
+- Proxies and the ambient fill are hidden in Render mode, so the tracer never sees them (it collects only *visible* rect/spot/point/directional lights, and ignores ambient entirely). The path-traced image is unchanged by any of this.
+- The **baked-env room** has no lamp object to stand in for, so it previews without shadows, lit by its environment map.
+
+Shadow maps are static between edits: `shadowMap.autoUpdate` is off and a `shadowsDirty` flag re-renders them on the first frame after anything moves, rather than every frame.
 
 A scene is **data**, not code: a chosen room + which objects are included + each object's material and transform + the scene's lights + the camera. The editor sidebar (in Edit mode) is: a **Room** dropdown, an **Objects** list (checkbox = in the scene, name = select for editing), a **Lights** list, and an inspector group for the selected object or light.
 
@@ -78,7 +90,7 @@ Why edits behave differently: material changes are cheap (`updateMaterials()` ke
 | **Intensity** | three.js physical units: candela for point/spot, nits for area. Defaults (20 cd, 80 nt) give roughly the room lamp's brightness straight below the light. |
 | **Position** | World position in meters. |
 
-Lights are invisible to camera rays in the path tracer, so in Edit mode each one is drawn as a small colored sphere. The spheres are rendered in a separate raster-only pass: they are never part of the path-traced scene, the BVH, or the ground-truth/depth exports. There is no light marker in Render mode.
+Lights cast shadows in the Edit-mode preview (see [Edit-mode shadows](#edit-mode-shadows)). They are invisible to camera rays in the path tracer, so in Edit mode each one is also drawn as a small colored sphere. The spheres are rendered in a separate raster-only pass: they are never part of the path-traced scene, the BVH, or the ground-truth/depth exports. There is no light marker in Render mode.
 
 Light edits don't need a BVH rebuild: `updateLights()` repacks the tracer's light list, immediately in Render mode or on return from Edit mode. Things to know:
 
