@@ -3,6 +3,7 @@
 		PathTracerViewer,
 		TransformPanel,
 		MaterialPanel,
+		LightPanel,
 		BundleTree,
 		PathTracerLab,
 		bundledTree,
@@ -15,6 +16,7 @@
 		type BundleFile,
 		type LabStatus,
 		type LabObject,
+		type LabLightEntry,
 		type RoomKind,
 	} from 'pt-lab';
 	import CameraControls from './CameraControls.svelte';
@@ -60,6 +62,7 @@
 		lab.applyScene(data);
 		roomKind = data.room;
 		selectedId = null;
+		selectedLightId = null;
 		sceneValue = `saved:${name}`;
 	}
 
@@ -74,6 +77,7 @@
 		lab.applyScene(data);
 		roomKind = data.room;
 		selectedId = null;
+		selectedLightId = null;
 		sceneValue = 'unsaved';
 	}
 
@@ -123,6 +127,30 @@
 		lab?.removeLibraryObject(id);
 	}
 
+	// Lights and objects share one selection: picking either clears the other,
+	// so the sidebar shows one inspector at a time.
+	let lights = $state<LabLightEntry[]>([]);
+	let selectedLightId = $state<string | null>(null);
+
+	function selectObject(id: string) {
+		selectedId = id;
+		selectedLightId = null;
+	}
+
+	function selectLight(id: string) {
+		selectedLightId = id;
+		selectedId = null;
+	}
+
+	function addLight() {
+		if (lab) selectLight(lab.addLight());
+	}
+
+	function removeLight(id: string) {
+		if (selectedLightId === id) selectedLightId = null;
+		lab?.removeLight(id);
+	}
+
 	// Names already in the current library, so the browser can mark them.
 	const importedNames = $derived(new Set(objects.map((o) => o.name)));
 
@@ -162,6 +190,12 @@
 		objects = lab.listObjects();
 	});
 
+	$effect(() => {
+		if (!lab) return;
+		lab.setOnLightsChanged((list) => (lights = list));
+		lights = lab.listLights();
+	});
+
 	const selectedName = $derived(objects.find((o) => o.id === selectedId)?.name ?? '');
 	// Recomputes only when the selection (or lab) changes — exactly when the
 	// TransformPanel should re-seed. Edits after that flow one-way to the lab.
@@ -171,6 +205,11 @@
 	const selectedMaterial = $derived(
 		selectedId && lab ? lab.getObjectMaterial(selectedId) : null,
 	);
+	// Read from the live list (not a one-time getLight), so when the LightPanel
+	// remounts — e.g. on re-entering Edit mode — it seeds from current values
+	// rather than those at selection time. The keyed panel ignores prop updates
+	// while mounted, and the group header follows renames.
+	const selectedLight = $derived(lights.find((l) => l.id === selectedLightId) ?? null);
 
 	// Resizable sidebar. Width is driven inline; the viewer's ResizeObserver
 	// keeps the canvas in sync as the sidebar grows/shrinks.
@@ -390,7 +429,7 @@
 										checked={obj.included}
 										onchange={(e) => lab?.setObjectIncluded(obj.id, e.currentTarget.checked)}
 									/>
-									<button class="obj-name" onclick={() => (selectedId = obj.id)}>
+									<button class="obj-name" onclick={() => selectObject(obj.id)}>
 										{obj.name}
 									</button>
 									{#if obj.removable}
@@ -420,6 +459,35 @@
 					onchange={onImportFile}
 					hidden
 				/>
+
+				<details class="group" open>
+					<summary>Lights</summary>
+					{#if lights.length}
+						<ul class="object-list">
+							{#each lights as light (light.id)}
+								<li class="obj-row" class:selected={light.id === selectedLightId}>
+									<span class="light-swatch" style:background={light.color}></span>
+									<button class="obj-name" onclick={() => selectLight(light.id)}>
+										{light.name}
+									</button>
+									<span class="light-type">{light.type}</span>
+									<button
+										class="obj-remove"
+										title="Remove light"
+										onclick={() => removeLight(light.id)}
+									>
+										×
+									</button>
+								</li>
+							{/each}
+						</ul>
+					{:else}
+						<p class="hint pad">No lights added — the room's own lighting still applies.</p>
+					{/if}
+					<div class="obj-import">
+						<button class="editor-btn" onclick={addLight}>Add light</button>
+					</div>
+				</details>
 
 				{#if !bundledIsEmpty}
 					<details class="group">
@@ -454,6 +522,18 @@
 					</details>
 				{/if}
 
+				{#if selectedLightId && selectedLight}
+					<details class="group" open>
+						<summary>Light — {selectedLight.name}</summary>
+						{#key selectedLightId}
+							<LightPanel
+								light={selectedLight}
+								onchange={(l) => selectedLightId && lab?.setLight(selectedLightId, l)}
+							/>
+						{/key}
+					</details>
+				{/if}
+
 				<div class="editor-actions">
 					<button class="editor-btn" onclick={saveScene}>Save…</button>
 					<button
@@ -467,7 +547,8 @@
 
 				<p class="hint">
 					Fast raster preview (no path tracing). Click a name to select, then edit
-					its material and transform. New starts an empty room; Save names the scene.
+					its material and transform — or a light's settings (lights show as small
+					spheres here only). New starts an empty room; Save names the scene.
 				</p>
 			</div>
 		{:else}
@@ -872,6 +953,19 @@
 	.obj-import {
 		padding: 0.5rem 0.75rem;
 		border-top: 1px solid #2a2a33;
+	}
+
+	.light-swatch {
+		flex: 0 0 auto;
+		width: 0.8rem;
+		height: 0.8rem;
+		border: 1px solid #3a3a45;
+		border-radius: 50%;
+	}
+
+	.light-type {
+		font-size: 0.7rem;
+		color: #777;
 	}
 
 	.bundle-tree {

@@ -19,17 +19,20 @@ import {
 	NoToneMapping,
 	PerspectiveCamera,
 	PlaneGeometry,
+	PointLight,
 	RepeatWrapping,
 	RGBAFormat,
 	Scene,
 	ShaderMaterial,
 	SphereGeometry,
+	SpotLight,
 	SRGBColorSpace,
 	TorusKnotGeometry,
 	Vector2,
 	Vector3,
 	WebGLRenderer,
 	WebGLRenderTarget,
+	type Light,
 	type Material,
 	type Object3D,
 	type Texture,
@@ -138,11 +141,58 @@ export interface SceneObjectState {
 	transform?: LabTransform;
 }
 
-/** A saved editor scene: room + per-object state + camera. */
+/**
+ * Editor light kinds. Spot and area lights aim at the room center (the floor
+ * origin). No directional light: in the geometric rooms the walls and ceiling
+ * occlude its infinitely distant source, so it would light the raster preview
+ * but not the path-traced render.
+ */
+export type LabLightType = 'point' | 'spot' | 'area';
+
+/** A light's editable state (plain data — no three.js types). */
+export interface LabLight {
+	name: string;
+	type: LabLightType;
+	color: string; // '#rrggbb' (sRGB)
+	/** three.js physical units: candela for point/spot, nits for area. */
+	intensity: number;
+	position: [number, number, number]; // meters
+}
+
+/** A light in the scene, addressable by a stable per-session id. */
+export interface LabLightEntry extends LabLight {
+	id: string;
+}
+
+/** Per-type metadata for building light controls. */
+export interface LabLightTypeInfo {
+	type: LabLightType;
+	label: string;
+	unit: string;
+	defaultIntensity: number;
+	maxIntensity: number;
+}
+
+// Defaults give roughly the room lamp's irradiance straight below the light
+// (the lamp is 40 nits over 0.5 m², ~20/d²): a point or spot of I candela
+// gives I/d², an area light of L nits over 0.25 m² gives L/4/d².
+export const LIGHT_TYPES: LabLightTypeInfo[] = [
+	{ type: 'point', label: 'Point', unit: 'cd', defaultIntensity: 20, maxIntensity: 200 },
+	{ type: 'spot', label: 'Spot', unit: 'cd', defaultIntensity: 20, maxIntensity: 200 },
+	{ type: 'area', label: 'Area (0.5 × 0.5 m)', unit: 'nt', defaultIntensity: 80, maxIntensity: 800 },
+];
+
+export function lightTypeInfo(type: LabLightType): LabLightTypeInfo {
+	return LIGHT_TYPES.find((t) => t.type === type) ?? LIGHT_TYPES[0];
+}
+
+/** A saved editor scene: room + per-object state + lights + camera. */
 export interface SceneData {
 	version: 1;
 	room: RoomKind;
 	objects: SceneObjectState[];
+	/** Absent in scenes saved before editor lights existed (= no lights). */
+	lights?: LabLight[];
 	camera: { position: [number, number, number]; target: [number, number, number] } | null;
 }
 
@@ -266,6 +316,11 @@ function disposeObject(obj: Object3D) {
 		if (Array.isArray(mat)) mat.forEach((m) => m.dispose());
 		else mat?.dispose();
 	});
+}
+
+/** Copy light data so callers never share the lab's position tuple. */
+function copyLight(l: LabLight): LabLight {
+	return { name: l.name, type: l.type, color: l.color, intensity: l.intensity, position: [...l.position] };
 }
 
 
@@ -412,6 +467,12 @@ const PATCH_RADIANCE = 40;
 // small fraction keeps the fixture bright to the eye while nearly all the
 // light transport stays on the importance-sampled path.
 const FIXTURE_FRACTION = 0.1;
+
+// Editor lights: side of the square area light, where new lights appear (above
+// the table), and the raster-only marker that shows each light in Edit mode.
+const AREA_LIGHT_SIZE = 0.5;
+const NEW_LIGHT_POSITION: [number, number, number] = [0, 2.2, 0];
+const LIGHT_MARKER_RADIUS = 0.04;
 
 /**
  * Framework-agnostic wrapper around WebGLPathTracer. This class is the piece
@@ -677,6 +738,19 @@ export class PathTracerLab {
 	private objectsDirty = false;
 	// Set when only materials changed — a cheaper updateMaterials() on return.
 	private materialsDirty = false;
+
+	// Editor lights, keyed by a stable per-session id. Lights live in their own
+	// group in the scene; each has a marker sphere in markerScene, which only the
+	// Edit-mode raster pass draws, so markers never reach the tracer's BVH or
+	// the ground-truth passes.
+	private lights = new Map<string, { light: Light; marker: Mesh; data: LabLight }>();
+	private lightCounter = 0;
+	private lightsGroup: Group | null = null;
+	private markerScene = new Scene();
+	private lightsChanged?: (lights: LabLightEntry[]) => void;
+	// Set when lights changed while editing — updateLights() on return, which
+	// repacks the light list without a BVH rebuild.
+	private lightsDirty = false;
 	// True while buildEditorScene rebuilds; suppresses tracer syncs against the
 	// half-built scene (setScene refreshes everything once the build finishes).
 	private buildingScene = false;
@@ -842,6 +916,7 @@ export class PathTracerLab {
 		this.ready = true;
 		this.lastResetAt = performance.now();
 		this.emitObjects();
+		this.emitLights();
 		this.loop();
 	}
 
@@ -1106,6 +1181,13 @@ export class PathTracerLab {
 			this.controls.update();
 			this.renderer.setRenderTarget(null);
 			this.renderer.render(this.scene, this.camera);
+			if (this.lights.size) {
+				// Light markers draw over the scene, depth-tested against it.
+				const prevAutoClear = this.renderer.autoClear;
+				this.renderer.autoClear = false;
+				this.renderer.render(this.markerScene, this.camera);
+				this.renderer.autoClear = prevAutoClear;
+			}
 			this.emit('editing');
 			return;
 		}
@@ -1410,14 +1492,19 @@ export class PathTracerLab {
 			if (this.objectsDirty) {
 				// Visibility or geometry changed; rebuild the BVH (setScene skips
 				// hidden meshes, refits moved geometry, and resets itself). This
-				// also re-reads materials, so any material edits are covered too.
+				// also re-reads materials and lights, so those edits are covered too.
 				this.objectsDirty = false;
 				this.materialsDirty = false;
+				this.lightsDirty = false;
 				this.pathTracer.setScene(this.scene, this.camera);
 			} else {
 				if (this.materialsDirty) {
 					this.materialsDirty = false;
 					this.pathTracer.updateMaterials();
+				}
+				if (this.lightsDirty) {
+					this.lightsDirty = false;
+					this.pathTracer.updateLights();
 				}
 				this.pathTracer.updateCamera();
 				this.pathTracer.reset();
@@ -1595,6 +1682,136 @@ export class PathTracerLab {
 		}
 	}
 
+	listLights(): LabLightEntry[] {
+		return [...this.lights].map(([id, e]) => ({ id, ...copyLight(e.data) }));
+	}
+
+	getLight(id: string): LabLight | null {
+		const entry = this.lights.get(id);
+		return entry ? copyLight(entry.data) : null;
+	}
+
+	/** Add a light (defaults fill anything unspecified); returns its id. */
+	addLight(init: Partial<LabLight> = {}): string {
+		const type = init.type ?? 'point';
+		const id = this.createLight({
+			name: init.name ?? `Light ${this.lights.size + 1}`,
+			type,
+			color: init.color ?? '#ffffff',
+			intensity: init.intensity ?? lightTypeInfo(type).defaultIntensity,
+			position: init.position ?? NEW_LIGHT_POSITION,
+		});
+		this.syncLights();
+		this.emitLights();
+		return id;
+	}
+
+	setLight(id: string, data: LabLight) {
+		const entry = this.lights.get(id);
+		if (!entry) return;
+		if (entry.data.type !== data.type) {
+			// Each type is a different three.js class — swap the object, keep the id.
+			entry.light.removeFromParent();
+			entry.light.dispose();
+			entry.light = this.makeLight(data.type);
+			this.ensureLightsGroup().add(entry.light);
+		}
+		entry.data = copyLight(data);
+		this.applyLightData(entry);
+		this.syncLights();
+		this.emitLights();
+	}
+
+	removeLight(id: string) {
+		const entry = this.lights.get(id);
+		if (!entry) return;
+		this.disposeLight(entry);
+		this.lights.delete(id);
+		this.syncLights();
+		this.emitLights();
+	}
+
+	setOnLightsChanged(cb: (lights: LabLightEntry[]) => void) {
+		this.lightsChanged = cb;
+	}
+
+	private emitLights() {
+		this.lightsChanged?.(this.listLights());
+	}
+
+	/** Build a light and its marker from data. Scene-graph only — no tracer sync. */
+	private createLight(data: LabLight): string {
+		const id = `light-${++this.lightCounter}`;
+		const entry = {
+			light: this.makeLight(data.type),
+			marker: new Mesh(
+				new SphereGeometry(LIGHT_MARKER_RADIUS, 16, 8),
+				new MeshBasicMaterial(),
+			),
+			data: copyLight(data),
+		};
+		this.ensureLightsGroup().add(entry.light);
+		this.markerScene.add(entry.marker);
+		this.applyLightData(entry);
+		this.lights.set(id, entry);
+		return id;
+	}
+
+	private makeLight(type: LabLightType): Light {
+		switch (type) {
+			case 'spot':
+				// 45° cone with a soft edge. Its default target sits at the origin.
+				return new SpotLight(0xffffff, 1, 0, Math.PI / 4, 0.2);
+			case 'area':
+				// LTC lookup tables for the rasterized preview frames.
+				RectAreaLightUniformsLib.init();
+				return new RectAreaLight(0xffffff, 1, AREA_LIGHT_SIZE, AREA_LIGHT_SIZE);
+			default:
+				return new PointLight();
+		}
+	}
+
+	private applyLightData(entry: { light: Light; marker: Mesh; data: LabLight }) {
+		const { light, marker, data } = entry;
+		light.name = data.name;
+		light.color.set(data.color);
+		light.intensity = data.intensity;
+		light.position.set(...data.position);
+		// A rect light has no target; it emits along its -Z, so face the origin.
+		if ((light as RectAreaLight).isRectAreaLight) light.lookAt(0, 0, 0);
+		// The tracer packs lights from matrixWorld, which may not have been
+		// refreshed by a render yet when it syncs immediately (render mode).
+		light.updateMatrixWorld();
+		marker.position.set(...data.position);
+		(marker.material as MeshBasicMaterial).color.set(data.color);
+	}
+
+	private ensureLightsGroup(): Group {
+		if (!this.lightsGroup) {
+			this.lightsGroup = new Group();
+			this.lightsGroup.name = 'Lights';
+			this.scene.add(this.lightsGroup);
+		}
+		return this.lightsGroup;
+	}
+
+	private disposeLight(entry: { light: Light; marker: Mesh }) {
+		entry.light.removeFromParent();
+		entry.light.dispose();
+		this.markerScene.remove(entry.marker);
+		disposeObject(entry.marker);
+	}
+
+	/** Light changes reach the tracer now in render mode, or on return from Edit. */
+	private syncLights() {
+		if (this.ready && !this.editing && !this.buildingScene) {
+			this.pathTracer.updateLights();
+			this.lastResetAt = performance.now();
+		} else {
+			this.lightsDirty = true;
+		}
+	}
+
 	setBounces(bounces: number) {
 		this.pathTracer.bounces = bounces;
 		if (this.ready) this.pathTracer.reset();
@@ -1701,6 +1918,7 @@ export class PathTracerLab {
 			version: 1,
 			room: this.roomKind ?? 'room-arealight',
 			objects,
+			lights: [...this.lights.values()].map((e) => copyLight(e.data)),
 			camera: {
 				position: [this.camera.position.x, this.camera.position.y, this.camera.position.z],
 				target: [this.controls.target.x, this.controls.target.y, this.controls.target.z],
@@ -1786,9 +2004,11 @@ export class PathTracerLab {
 		this.hideDenoise();
 		this.buildEditorScene(data);
 		this.emitObjects();
+		this.emitLights();
 		if (this.editing) {
 			this.objectsDirty = true;
 		} else {
+			this.lightsDirty = false;
 			this.pathTracer.setScene(this.scene, this.camera);
 			this.lastResetAt = performance.now();
 		}
@@ -1796,12 +2016,16 @@ export class PathTracerLab {
 
 	/**
 	 * Rebuild the scene from scratch: floor + object library + room + saved
-	 * per-object state + camera. Starting from a clean slate means applyScene
-	 * works identically no matter what was loaded before (a demo or another
-	 * saved scene).
+	 * per-object state + lights + camera. Starting from a clean slate means
+	 * applyScene works identically no matter what was loaded before (a demo or
+	 * another saved scene).
 	 */
 	private buildEditorScene(data: SceneData) {
 		this.buildingScene = true;
+		for (const entry of this.lights.values()) this.disposeLight(entry);
+		this.lights.clear();
+		this.lightCounter = 0;
+		this.lightsGroup = null;
 		for (const child of [...this.scene.children]) {
 			this.scene.remove(child);
 			disposeObject(child);
@@ -1838,6 +2062,8 @@ export class PathTracerLab {
 			if (saved?.material) this.setObjectMaterial(id, saved.material);
 			if (saved?.transform) this.setObjectTransform(id, saved.transform);
 		}
+
+		for (const light of data.lights ?? []) this.createLight(light);
 
 		if (data.camera) {
 			this.camera.position.set(...data.camera.position);

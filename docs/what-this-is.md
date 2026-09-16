@@ -50,7 +50,7 @@ The **Edit Scene / Return to Render** button toggles between two modes:
 - **Render** — the path-traced Live Scene described above (plus AI denoising).
 - **Edit** — a fast **raster** preview (`renderer.render(scene, camera)` each frame, no accumulation) for composing a scene. Edits show instantly; the traced BVH only rebuilds when you return to Render. Raster fidelity varies by room — reflections need a `scene.environment` or direct light, so the emissive room looks dark in Edit and is best judged in Render.
 
-A scene is **data**, not code: a chosen room + which objects are included + each object's material and transform + the camera. The editor sidebar (in Edit mode) is: a **Room** dropdown, an **Objects** list (checkbox = in the scene, name = select for editing), and inspector groups for the selected object.
+A scene is **data**, not code: a chosen room + which objects are included + each object's material and transform + the scene's lights + the camera. The editor sidebar (in Edit mode) is: a **Room** dropdown, an **Objects** list (checkbox = in the scene, name = select for editing), a **Lights** list, and an inspector group for the selected object or light.
 
 ### Editing objects — material properties
 
@@ -66,9 +66,30 @@ The two sliders together span a wide range — shiny+reflective = chrome, shiny+
 
 Why edits behave differently: material changes are cheap (`updateMaterials()` keeps the BVH); moving/scaling geometry needs a BVH refit, so it applies live in raster and rebuilds via `setScene()` on return to Render.
 
+### Lights
+
+**Add light** (in the Lights group) adds a light to the scene; a scene can hold any number, alongside the room's own lighting. Select one to edit it in the **Light** inspector, and remove it with **×**:
+
+| Control | Meaning |
+|---|---|
+| **Name** | Display name in the Lights list. |
+| **Type** | **Point** (`PointLight`, radiates in all directions), **Spot** (`SpotLight`, 45° cone with a soft edge), or **Area** (0.5 × 0.5 m `RectAreaLight`, one-sided). Spot and area lights aim at the room center (the floor origin). Changing type resets intensity to that type's default. |
+| **Color** | Light color (sRGB). |
+| **Intensity** | three.js physical units: candela for point/spot, nits for area. Defaults (20 cd, 80 nt) give roughly the room lamp's brightness straight below the light. |
+| **Position** | World position in meters. |
+
+Lights are invisible to camera rays in the path tracer, so in Edit mode each one is drawn as a small colored sphere. The spheres are rendered in a separate raster-only pass: they are never part of the path-traced scene, the BVH, or the ground-truth/depth exports. There is no light marker in Render mode.
+
+Light edits don't need a BVH rebuild: `updateLights()` repacks the tracer's light list, immediately in Render mode or on return from Edit mode. Things to know:
+
+- **Point lights have no size**, so their shadows are perfectly hard and they don't appear in mirror reflections. Use an Area light for soft shadows.
+- **Each light added makes every light noisier.** Each sample picks one light at random, so the room lamp's soft shadows take longer to converge.
+- **No directional (sun) light.** In the geometric rooms the walls and ceiling would block its infinitely distant source, so it would light the raster preview but not the path-traced render.
+- **The Environment slider doesn't affect editor lights**; it still scales only the room lamp or the baked environment.
+
 ### Persistence
 
-Scenes are named and saved to localStorage (**New** / **Save…** / **Delete**). A new scene is a room with its light and no objects. The render-mode Scene dropdown lists the built-in demos (which reload) plus saved scenes (which apply live, rebuilt from scratch by `applyScene` so loading works identically from any starting point). Two storage tiers: the **object library** (Table/Cube/Ball + imports) persists globally; each **scene** stores only per-object inclusion/material/transform keyed by object name.
+Scenes are named and saved to localStorage (**New** / **Save…** / **Delete**). A new scene is a room with its light and no objects. The render-mode Scene dropdown lists the built-in demos (which reload) plus saved scenes (which apply live, rebuilt from scratch by `applyScene` so loading works identically from any starting point). Two storage tiers: the **object library** (Table/Cube/Ball + imports) persists globally; each **scene** stores only per-object inclusion/material/transform keyed by object name, plus its lights (scenes saved before lights existed load with none).
 
 ### Importing Blender models
 
@@ -82,7 +103,7 @@ Recommended Blender export: **File → Export → glTF 2.0**, format **glTF Bina
 
 Everything the editor persists lives in the browser's **localStorage**, which is small — roughly **5 MB per origin, shared across all of the app's storage**. Two tiers:
 
-- **Saved scenes** (`pt-lab.scenes`) are lightweight — just references and numbers (room, per-object inclusion/material/transform, camera).
+- **Saved scenes** (`pt-lab.scenes`) are lightweight — just references and numbers (room, per-object inclusion/material/transform, lights, camera).
 - **Imported objects** (`pt-lab.library`) are the heavy tier: every import — from the file picker *or* the bundled browser — stores the `.glb` bytes as base64, which inflates the raw file size by ~33%.
 
 So the real constraint is the number and size of imported objects. A handful of simple, untextured meshes (like the letter set) is fine; large or textured models, or many imports, can exhaust the quota. When a save would overflow, **the import is aborted** (nothing already stored is lost) and the app shows a **"Storage full — delete some scenes or objects"** message. Mitigations: keep imported meshes simple and untextured, and remove unused ones with the **×** in the Objects list. If a large *bundled* set ever becomes the bottleneck, the intended fix is to make bundled objects a **non-persisted tier** — loaded from the app's assets each session (they're always available at their URLs) rather than copied into localStorage on import.

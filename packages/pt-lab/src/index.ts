@@ -9,6 +9,7 @@
 export { default as PathTracerViewer } from './lib/PathTracerViewer.svelte';
 export { default as TransformPanel } from './lib/TransformPanel.svelte';
 export { default as MaterialPanel } from './lib/MaterialPanel.svelte';
+export { default as LightPanel } from './lib/LightPanel.svelte';
 export { default as BundleTree } from './lib/BundleTree.svelte';
 
 // Core renderer/editor class + all its data types
