@@ -24,7 +24,7 @@ An npm-workspaces monorepo: `packages/pt-lab` is the consumable library, `packag
 | `packages/pt-lab/src/lib/pathtracer.ts` | **The reusable core.** Framework-agnostic class wrapping renderer, scene, controls, and `WebGLPathTracer`. Talks to the host only through public methods and callbacks (`onStatus`, `onObjectsChanged`). Also owns the Scene Editor model: object registry, room swapping, serialize/apply, `.glb` import. Asset URLs are configurable via `LabOptions`. |
 | `packages/pt-lab/src/lib/PathTracerViewer.svelte` | Thin Svelte binding: mounts the class on a canvas, wires `ResizeObserver`, disposes on unmount. |
 | `packages/pt-lab/src/lib/TransformPanel.svelte`, `MaterialPanel.svelte`, `BundleTree.svelte` | Inspector panels + the bundled-objects tree. |
-| `packages/pt-lab/src/lib/scenes.ts`, `library-store.ts` | localStorage stores for named scenes and imported `.glb` objects. |
+| `packages/pt-lab/src/lib/scenes.ts`, `library-store.ts` | Persistence for named scenes (localStorage) and imported `.glb` objects (IndexedDB). |
 | `packages/pt-lab/src/lib/bundled.ts` + `src/assets/imports/` | Build-time enumeration of bundled importable objects (travels with the library). |
 | `packages/demo/src/App.svelte` | Control panel + Scene Editor UI (Svelte 5 runes), importing everything from `'pt-lab'`. |
 | `packages/demo/public/assets/` | Demo model + HDR + denoiser weights, served by the demo app. |
@@ -101,24 +101,32 @@ Light edits don't need a BVH rebuild: `updateLights()` repacks the tracer's ligh
 
 ### Persistence
 
-Scenes are named and saved to localStorage (**New** / **Save…** / **Export** / **Delete**). **Export** downloads the current scene as `<name>.pt-scene.json` — the same `SceneData` that Save stores, pretty-printed, so a scene can be kept in a repo or moved between browsers. Objects are referenced by library key, so a scene using imported `.glb` models needs those imports present to load; they don't travel in the file. There is no import button yet — paste an exported scene back with `localStorage.setItem('pt-lab.scenes', …)` or `lab.applyScene(data)` in the console. A new scene is a room with its light and no objects. The render-mode Scene dropdown lists the built-in demos (which reload) plus saved scenes (which apply live, rebuilt from scratch by `applyScene` so loading works identically from any starting point). Two storage tiers: the **object library** (Table/Cube/Ball + imports) persists globally; each **scene** stores only per-object inclusion/material/transform keyed by object name, plus its lights (scenes saved before lights existed load with none).
+Scenes are named and saved to localStorage (**New** / **Save…** / **Export** / **Delete**). **Export** downloads the current scene as `<name>.pt-scene.json` — the same `SceneData` that Save stores, pretty-printed, so a scene can be kept in a repo or moved between browsers (localStorage is per origin, and the port counts: `localhost:5173` and `localhost:5174` are different stores). Objects are referenced by library key, so a scene using imported `.glb` models needs those imports present to load; they don't travel in the file. There is no import button yet — paste an exported scene back with `localStorage.setItem('pt-lab.scenes', …)` or `lab.applyScene(data)` in the console. A new scene is a room with its light and no objects. The render-mode Scene dropdown lists the built-in demos (which reload) plus saved scenes (which apply live, rebuilt from scratch by `applyScene` so loading works identically from any starting point). Two storage tiers: the **object library** (Table/Cube/Ball + imports) persists globally; each **scene** stores only per-object inclusion/material/transform keyed by library key, plus its lights (scenes saved before lights existed load with none).
 
 ### Importing Blender models
 
-**Import .glb…** (in the Objects group) adds a model to the object library; it persists (bytes stored base64 in localStorage) and appears in every editor scene without re-importing. The **×** beside an imported object removes it. Imports are parsed once into a template and cloned per scene with independent materials, so editing one scene's copy doesn't affect others.
+**Import .glb…** (in the Objects group) adds a model to the object library; it persists (raw bytes in IndexedDB — see [Where the editor's data lives](#where-the-editors-data-lives)) and appears in every editor scene without re-importing. The **×** beside an imported object removes it. Imports are parsed once into a template and cloned per scene with independent materials, so editing one scene's copy doesn't affect others.
 
 **Bundled objects**: a "Bundled objects" browser (in the Objects group) lists `.glb` files that ship with the app under `src/assets/imports/`, as a tree mirroring the folder layout. `src/lib/bundled.ts` enumerates them at build time with `import.meta.glob('../assets/imports/**/*.glb', { query: '?url', eager: true })` and assembles the flat result into a directory tree — drop a new file or subdirectory into `assets/imports/` and it appears automatically, no manifest to maintain. Clicking a file fetches its URL and runs it through the same `importGLB` as the file picker (so it joins the persistent library); files already in the library are marked and disabled.
 
-Recommended Blender export: **File → Export → glTF 2.0**, format **glTF Binary (.glb)**. Use the **Principled BSDF** (its base color, roughness, metallic, transmission, IOR, and emission map to the material via KHR extensions). **Turn off Draco / mesh compression** — no decompressor is wired in. Apply object transforms (**Ctrl+A → All Transforms**) so the position/rotation/scale sliders behave predictably; the exporter's default **+Y up** is correct. Keep meshes simple and untextured — see Storage limits below.
+Recommended Blender export: **File → Export → glTF 2.0**, format **glTF Binary (.glb)**. Use the **Principled BSDF** (its base color, roughness, metallic, transmission, IOR, and emission map to the material via KHR extensions). **Turn off Draco / mesh compression** — no decompressor is wired in. Apply object transforms (**Ctrl+A → All Transforms**) so the position/rotation/scale sliders behave predictably; the exporter's default **+Y up** is correct. Textured multi-MB models are fine since imports moved to IndexedDB — see [Where the editor's data lives](#where-the-editors-data-lives).
 
-### Storage limits ⚠️
+### Where the editor's data lives
 
-Everything the editor persists lives in the browser's **localStorage**, which is small — roughly **5 MB per origin, shared across all of the app's storage**. Two tiers:
+Everything the editor persists is **per browser profile and per origin** — and the port is part of the origin, so `localhost:5173` and `localhost:5174` are separate stores. Two tiers, in two different databases:
 
-- **Saved scenes** (`pt-lab.scenes`) are lightweight — just references and numbers (room, per-object inclusion/material/transform, lights, camera).
-- **Imported objects** (`pt-lab.library`) are the heavy tier: every import — from the file picker *or* the bundled browser — stores the `.glb` bytes as base64, which inflates the raw file size by ~33%.
+- **Saved scenes** (`localStorage`, key `pt-lab.scenes`) are lightweight — just references and numbers (room, per-object inclusion/material/transform, lights, camera). localStorage is small, roughly 5 MB per origin, which is ample for scenes.
+- **Imported objects** (**IndexedDB**, database `pt-lab`, store `imports`) are the heavy tier: every import — from the file picker *or* the bundled browser — stores the raw `.glb` bytes as an `ArrayBuffer`. IndexedDB's quota is far larger than localStorage's and the bytes are stored directly, so textured multi-MB models fit. Imports used to live in localStorage as base64; that store (`pt-lab.library`) is migrated into IndexedDB once on first open and then removed.
 
-So the real constraint is the number and size of imported objects. A handful of simple, untextured meshes (like the letter set) is fine; large or textured models, or many imports, can exhaust the quota. When a save would overflow, **the import is aborted** (nothing already stored is lost) and the app shows a **"Storage full — delete some scenes or objects"** message. Mitigations: keep imported meshes simple and untextured, and remove unused ones with the **×** in the Objects list. If a large *bundled* set ever becomes the bottleneck, the intended fix is to make bundled objects a **non-persisted tier** — loaded from the app's assets each session (they're always available at their URLs) rather than copied into localStorage on import.
+Quota can still be exhausted eventually (IndexedDB is bounded by available disk and browser policy). When a save would overflow, **the import is aborted** (nothing already stored is lost) and the app shows a **"Storage full — delete some scenes or objects"** message. Remove unused imports with the **×** in the Objects list.
+
+Each import gets a generated key, `import-<base36 timestamp>-<counter>`, and scenes reference objects by that key. The key is minted per import, so the *same* `.glb` imported in another browser — or re-imported after clearing site data — gets a *different* key, and a scene exported from elsewhere won't resolve it. To inspect the library:
+
+```js
+const db = await new Promise(r => { const q = indexedDB.open('pt-lab'); q.onsuccess = () => r(q.result); });
+const all = await new Promise(r => { const q = db.transaction('imports').objectStore('imports').getAll(); q.onsuccess = () => r(q.result); });
+all.map(i => ({ key: i.key, name: i.name, kb: Math.round(i.glb.byteLength / 1024) }))
+```
 
 ## Integration notes for the larger web app
 

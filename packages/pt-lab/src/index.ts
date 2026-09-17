@@ -18,7 +18,7 @@ export * from './lib/pathtracer';
 // Named-scene persistence (localStorage)
 export * from './lib/scenes';
 
-// Imported-object persistence (localStorage) + base64 helpers
+// Imported-object persistence (IndexedDB)
 export * from './lib/library-store';
 
 // Build-time enumeration of bundled importable objects
