@@ -12,6 +12,7 @@
 		loadSceneData,
 		saveSceneData,
 		deleteSceneData,
+		exportSceneData,
 		newSceneData,
 		type BundleFile,
 		type LabStatus,
@@ -89,6 +90,10 @@
 		saveSceneData(name, lab.serializeScene());
 		savedScenes = listSceneNames();
 		sceneValue = `saved:${name}`;
+	}
+
+	function exportScene() {
+		if (lab) exportSceneData(currentSceneName, lab.serializeScene());
 	}
 
 	function deleteScene() {
@@ -541,6 +546,9 @@
 
 				<div class="editor-actions">
 					<button class="editor-btn" onclick={saveScene}>Save…</button>
+					<button class="editor-btn" onclick={exportScene} title="Download this scene as JSON">
+						Export
+					</button>
 					<button
 						class="editor-btn"
 						onclick={deleteScene}
