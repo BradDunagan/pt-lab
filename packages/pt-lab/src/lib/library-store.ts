@@ -65,6 +65,11 @@ export function listImports(): Promise<StoredImport[]> {
 	return tx('readonly', (s) => s.getAll() as IDBRequest<StoredImport[]>).then((r) => r ?? []);
 }
 
+/** One stored import by key, or null if this browser has none under it. */
+export function getImport(key: string): Promise<StoredImport | null> {
+	return tx('readonly', (s) => s.get(key) as IDBRequest<StoredImport | undefined>).then((r) => r ?? null);
+}
+
 /** Rejects (QuotaExceededError) if storage is exhausted — caller surfaces it. */
 export async function saveImport(rec: StoredImport): Promise<void> {
 	await tx('readwrite', (s) => s.put(rec));

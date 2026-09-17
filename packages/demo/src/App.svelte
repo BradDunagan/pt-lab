@@ -92,8 +92,16 @@
 		sceneValue = `saved:${name}`;
 	}
 
-	function exportScene() {
-		if (lab) exportSceneData(currentSceneName, lab.serializeScene());
+	let exportError = $state('');
+
+	async function exportScene() {
+		if (!lab) return;
+		exportError = '';
+		try {
+			await exportSceneData(currentSceneName, lab.serializeScene());
+		} catch (err) {
+			exportError = `Export failed: ${err instanceof Error ? err.message : String(err)}`;
+		}
 	}
 
 	function deleteScene() {
@@ -546,7 +554,11 @@
 
 				<div class="editor-actions">
 					<button class="editor-btn" onclick={saveScene}>Save…</button>
-					<button class="editor-btn" onclick={exportScene} title="Download this scene as JSON">
+					<button
+						class="editor-btn"
+						onclick={exportScene}
+						title="Download this scene as JSON, with the .glb of each included imported model"
+					>
 						Export
 					</button>
 					<button
@@ -557,6 +569,7 @@
 						Delete
 					</button>
 				</div>
+				{#if exportError}<p class="hint error">{exportError}</p>{/if}
 
 				<p class="hint">
 					Fast raster preview (no path tracing). Click a name to select, then edit

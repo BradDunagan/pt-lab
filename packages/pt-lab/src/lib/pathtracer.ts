@@ -104,6 +104,8 @@ interface LibraryItem {
 	key: string;
 	name: string;
 	kind: 'builtin' | 'imported';
+	/** SHA-256 of an import's .glb bytes (lowercase hex); absent for built-ins. */
+	sha256?: string;
 }
 
 const BUILTIN_LIBRARY: LibraryItem[] = [
@@ -137,6 +139,16 @@ export interface LabMaterial {
 export interface SceneObjectState {
 	key: string; // stable library key (the object's name for built-ins)
 	included: boolean;
+	/**
+	 * Imported objects only: the file name Export writes the model's .glb under
+	 * (see modelFileName), and the SHA-256 of those bytes. The key alone names
+	 * an IndexedDB record in whichever browser imported the model, which no
+	 * other host can resolve; these let a host outside that browser find the
+	 * file and confirm it is the same model. Absent for built-ins, and in
+	 * scenes saved before they existed.
+	 */
+	glb?: string;
+	sha256?: string;
 	// Absent means "use the object's factory default" (how demos include
 	// built-ins without duplicating their default look/placement).
 	material?: LabMaterial;
@@ -342,6 +354,30 @@ function makeProxyLight(): SpotLight {
 	proxy.shadow.bias = -0.0005;
 	proxy.shadow.normalBias = 0.02;
 	return proxy;
+}
+
+/**
+ * SHA-256 of some bytes as lowercase hex, or undefined where Web Crypto is not
+ * available (crypto.subtle exists only in secure contexts: https, localhost,
+ * or a scheme registered as secure). Undefined rather than a throw, so a plain
+ * http page can still import models; Export is what refuses without a hash.
+ */
+async function sha256Hex(bytes: ArrayBuffer): Promise<string | undefined> {
+	if (!globalThis.crypto?.subtle) return undefined;
+	const digest = await crypto.subtle.digest('SHA-256', bytes);
+	return [...new Uint8Array(digest)].map((b) => b.toString(16).padStart(2, '0')).join('');
+}
+
+/**
+ * The file name an imported model is exported under: its library name, made
+ * safe for a file system, plus the first 12 hex digits of its SHA-256. The
+ * hash is in the name so two different models that share a name — two
+ * `bracket.glb`s — cannot overwrite each other in one directory, and the same
+ * model exported from several scenes lands on one file.
+ */
+export function modelFileName(name: string, sha256: string): string {
+	const safe = name.replace(/[\\/:*?"<>| -]+/g, '_').trim() || 'model';
+	return `${safe}-${sha256.slice(0, 12)}.glb`;
 }
 
 /** Copy light data so callers never share the lab's position tuple. */
@@ -2096,7 +2132,13 @@ export class PathTracerLab {
 			const material = this.getObjectMaterial(id);
 			const transform = this.getObjectTransform(id);
 			if (!material || !transform) continue;
-			objects.push({ key: entry.key, included: entry.included, material, transform });
+			const state: SceneObjectState = { key: entry.key, included: entry.included, material, transform };
+			const item = this.library.find((i) => i.key === entry.key);
+			if (item?.sha256) {
+				state.glb = modelFileName(item.name, item.sha256);
+				state.sha256 = item.sha256;
+			}
+			objects.push(state);
 		}
 		return {
 			version: 1,
@@ -2114,9 +2156,10 @@ export class PathTracerLab {
 	private async loadImports() {
 		for (const rec of await listImports()) {
 			try {
+				const sha256 = await sha256Hex(rec.glb);
 				const template = await this.parseGLB(rec.glb);
 				this.importTemplates.set(rec.key, template);
-				this.library.push({ key: rec.key, name: rec.name, kind: 'imported' });
+				this.library.push({ key: rec.key, name: rec.name, kind: 'imported', sha256 });
 			} catch (err) {
 				console.warn('Failed to load imported object:', rec.name, err);
 			}
@@ -2138,13 +2181,14 @@ export class PathTracerLab {
 
 	/** Import a .glb into the library (persisted) and add it to the scene. */
 	async importGLB(buffer: ArrayBuffer, filename: string): Promise<void> {
+		const sha256 = await sha256Hex(buffer);
 		const template = await this.parseGLB(buffer);
 		const key = `import-${Date.now().toString(36)}-${this.importCounter++}`;
 		const name = filename.replace(/\.(glb|gltf)$/i, '').trim() || 'Imported';
 		// Persist first so a quota failure aborts before we mutate state.
 		await saveImport({ key, name, glb: buffer });
 		this.importTemplates.set(key, template);
-		this.library.push({ key, name, kind: 'imported' });
+		this.library.push({ key, name, kind: 'imported', sha256 });
 
 		// Add an instance (hidden) so it appears in the list immediately.
 		const obj = this.cloneWithMaterials(template);
@@ -2153,6 +2197,41 @@ export class PathTracerLab {
 		this.scene.add(obj);
 		this.objectsDirty = true;
 		this.emitObjects();
+	}
+
+	/**
+	 * Add a .glb to the library under a key the caller chooses, in memory only.
+	 *
+	 * For a host rendering a scene exported from another browser: the scene
+	 * names each import by that browser's key, so the model has to come back
+	 * under the same key for applyScene to find it. Unlike importGLB it never
+	 * touches IndexedDB — a host that persisted every model it rendered would
+	 * load all of them again on its next init(), and what it renders would
+	 * start to depend on what it rendered before.
+	 *
+	 * Call it before applyScene, which instantiates the library. A key already
+	 * in the library is refused rather than replaced: two models under one key
+	 * would leave the scene's reference ambiguous.
+	 *
+	 * Resolves with the bytes' SHA-256 (undefined outside a secure context), so
+	 * the caller can confirm it registered the model the scene recorded.
+	 */
+	async registerImport(key: string, name: string, buffer: ArrayBuffer): Promise<string | undefined> {
+		if (this.library.some((i) => i.key === key)) {
+			throw new Error(`registerImport: "${key}" is already in the library`);
+		}
+		const sha256 = await sha256Hex(buffer);
+		const template = await this.parseGLB(buffer);
+		this.importTemplates.set(key, template);
+		this.library.push({ key, name, kind: 'imported', sha256 });
+
+		const obj = this.cloneWithMaterials(template);
+		obj.visible = false;
+		this.registerObject(obj, name, key);
+		this.scene.add(obj);
+		this.objectsDirty = true;
+		this.emitObjects();
+		return sha256;
 	}
 
 	/** Remove an imported object from the library (built-ins are permanent). */
